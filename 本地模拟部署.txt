@@ -1,0 +1,60 @@
+下载python 3.11版本（3.11.9）满足SSL网络连接条件
+
+	# 建议新建一个虚拟环境
+	python -m venv .venv
+	# Windows
+	.\.venv\Scripts\activate
+	pip install -r requirements.txt
+
+开启4个powershell终端，分别模拟4个expert函数实例（目前的代码是top-k=2）
+	.\.venv\Scripts\activate
+	uvicorn expert_fn:app --host 0.0.0.0 --port 9100
+	
+	.\.venv\Scripts\activate
+	uvicorn expert_fn:app --host 0.0.0.0 --port 9101
+	
+	.\.venv\Scripts\activate
+	uvicorn expert_fn:app --host 0.0.0.0 --port 9102
+	
+	.\.venv\Scripts\activate
+	uvicorn expert_fn:app --host 0.0.0.0 --port 9103
+		(可以不加的)
+	" $env:EXPERT_ID = "0"
+	  $env:EMB_DIM   = "256" "
+
+开启2个powershell终端，模拟2个pre函数实例
+	.\.venv\Scripts\activate
+	uvicorn pre_fn:app --host 0.0.0.0 --port 9000
+	
+	.\.venv\Scripts\activate
+	uvicorn pre_fn:app --host 0.0.0.0 --port 9002
+	
+	——完整版本
+	.\.venv\Scripts\activate
+	$env:EXP_INSTANCES_FILE = "experts.json"
+	$env:USE_HYBRID = "1"
+	$env:USE_LGBM = "1"
+	$env:INSTANCE_TOP_K = "2"
+	$env:LGB_MODEL_PATH = "lgb_instance_selector.txt"
+	$env:TOP_K = "2"
+	uvicorn pre_fn:app --host 0.0.0.0 --port 9000
+
+
+开启2个powershell终端，模拟2个post函数实例
+	.\.venv\Scripts\activate
+	uvicorn post_fn:app --host 0.0.0.0 --port 9001
+	
+	.\.venv\Scripts\activate
+	uvicorn post_fn:app --host 0.0.0.0 --port 9003
+
+再开启新的powershell窗口用于运行controller.py
+	.\.venv\Scripts\activate
+
+	$env:PRE_INSTANCES_JSON  = (Get-Content .\pre_instances.json  -Raw)
+	$env:POST_INSTANCES_JSON = (Get-Content .\post_instances.json -Raw)
+
+	$env:LGB_MODEL_PATH = "lgb_instance_selector.txt"
+
+	# 启动一次训练 step
+	python controller.py
+	
