@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Literal, Tuple
 import random
-import time
 
 Mode = Literal["hot", "cold", "http", "local", "fallback"]
+
 
 @dataclass
 class CommResult:
@@ -14,6 +14,7 @@ class CommResult:
     bytes_sent: int
     ok: bool
     reason: str
+
 
 class CommPolicy:
     """
@@ -24,6 +25,7 @@ class CommPolicy:
     - local: 几乎 0（用于“同机/同进程”模拟）
     - fallback: 兜底
     """
+
     def __init__(
         self,
         hot_ms: Tuple[float, float] = (1.0, 3.0),
@@ -59,12 +61,14 @@ class CommPolicy:
         """
         deadline_ms: 本 step 的 budget
         elapsed_ms: 已经消耗的时间（用于触发切换）
+        allow_fallback: 是否允许切换到其他通道（消融实验会用到）
         """
-        # deadline 紧张时强制走更快的通道
         slack = deadline_ms - elapsed_ms
-        if slack < 8.0 and self.enable_local:
+
+        # 只有 allow_fallback=True 才允许因为 deadline 紧张而强制切换
+        if slack < 8.0 and self.enable_local and allow_fallback:
             return CommResult("local", 0.2, bytes_sent, True, "tight_deadline->local")
-        if slack < 8.0 and prefer in ("cold",):
+        if slack < 8.0 and prefer in ("cold",) and allow_fallback:
             prefer = "http"
 
         def attempt(mode: Mode) -> CommResult:

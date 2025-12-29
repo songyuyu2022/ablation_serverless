@@ -36,8 +36,8 @@ def estimate_objectives(
     - 3: stall     : 超过 deadline 的惩罚时间 (ms)
     """
     bw_table = {
-        "hot": float(os.getenv("HOT_BW_MBPS", "800")),   # Redis 假设带宽高
-        "cold": float(os.getenv("COLD_BW_MBPS", "200")), # OSS 假设带宽较低
+        "hot": float(os.getenv("HOT_BW_MBPS", "800")),    # Redis 假设带宽高
+        "cold": float(os.getenv("COLD_BW_MBPS", "200")),  # OSS 假设带宽较低
         "http": float(os.getenv("HTTP_BW_MBPS", "100")),
     }
     rtt_table = {
@@ -155,14 +155,12 @@ def nsga2_select(
     modes: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[Dict[str, Any], str]]:
     """
-    使用 NSGA-II 在 (实例, 通信模式) 组合上做多目标搜索。
+    使用 NSGA-II 在 (实例, 通信模式) 组合上做多目标搜索（论文级实现）。
 
-    参数:
-    - inst_list: 候选实例列表，每个元素包含 meta/dyn 信息。
-    - req: 请求特征，必须包含 grad_bytes。
-    - deadline_ms: 期望完成时间，用于 stall 目标。
-    - pop_size / generations: NSGA-II 超参数。
-    - modes: 可选的模式子集；如果为 None，则使用 feasible_modes()。
+    关键修复：
+    1) **硬可行性过滤**：stall > 0 的候选直接剔除，避免用“超时换便宜”造成 Full 方案延迟虚高/不稳定。
+    2) 若无可行解：fallback 到最小 bw_time（最小延迟）保证系统可运行。
+    3) 在可行解空间内，再用 NSGA-II 的非支配排序 + crowding 选择，并用归一化加权得到最终解。
     """
     rnd = random.Random(seed or 1234)
     modes = list(modes) if modes is not None else feasible_modes()
@@ -170,28 +168,53 @@ def nsga2_select(
     if not inst_list or not modes:
         return None
 
-    # 把 search space 表示为 (inst_idx, mode_idx)
-    def rand_ind() -> List[int]:
-        return [rnd.randrange(0, len(inst_list)), rnd.randrange(0, len(modes))]
-
-    def eval_ind(ind: Sequence[int]) -> np.ndarray:
-        inst = inst_list[ind[0]]
-        mode = modes[ind[1]]
+    def eval_pair(inst: Dict[str, Any], mode: str) -> np.ndarray:
         return estimate_objectives(inst, mode, req, deadline_ms)
 
-    # 初始化种群
-    pop: List[List[int]] = [rand_ind() for _ in range(pop_size)]
-    pop_objs: List[np.ndarray] = [eval_ind(ind) for ind in pop]
+    # ------------------------------------------------------------
+    # 1) Hard feasibility filter (stall == 0)
+    # ------------------------------------------------------------
+    feasible_pairs: List[Tuple[Dict[str, Any], str]] = []
+    feasible_objs: List[np.ndarray] = []
+    for inst in inst_list:
+        for mode in modes:
+            obj = eval_pair(inst, mode)
+            if float(obj[3]) <= 0.0:  # stall
+                feasible_pairs.append((inst, mode))
+                feasible_objs.append(obj)
 
-    for _ in range(generations):
-        # 非支配排序
+    # No feasible -> fallback to minimum latency
+    if not feasible_pairs:
+        best_inst = None
+        best_mode = None
+        best_bw = float("inf")
+        for inst in inst_list:
+            for mode in modes:
+                bw = float(eval_pair(inst, mode)[0])
+                if bw < best_bw:
+                    best_bw = bw
+                    best_inst, best_mode = inst, mode
+        return (best_inst, best_mode) if best_inst is not None else None
+
+    # ------------------------------------------------------------
+    # 2) NSGA-II inside feasible space
+    # ------------------------------------------------------------
+    def rand_ind() -> int:
+        return rnd.randrange(0, len(feasible_pairs))
+
+    def eval_ind(ind: int) -> np.ndarray:
+        return feasible_objs[ind]
+
+    pop: List[int] = [rand_ind() for _ in range(min(pop_size, len(feasible_pairs)))]
+    pop_objs: List[np.ndarray] = [eval_ind(i) for i in pop]
+
+    for _ in range(max(1, generations)):
         fronts, _ = _fast_non_dominated_sort(pop_objs)
-        new_pop: List[List[int]] = []
-        new_objs: List[np.ndarray] = []
 
+        new_pop: List[int] = []
+        new_objs: List[np.ndarray] = []
         for front in fronts:
             if len(new_pop) + len(front) > pop_size:
-                # 按 crowding distance 选择一部分
                 dist = _crowding_distance(front, pop_objs)
                 sorted_front = sorted(front, key=lambda i: dist[i], reverse=True)
                 remain = pop_size - len(new_pop)
@@ -208,25 +231,18 @@ def nsga2_select(
 
         pop, pop_objs = new_pop, new_objs
 
-        # 交叉 + 变异
-        offspring: List[List[int]] = []
-        while len(offspring) < pop_size:
-            p1, p2 = rnd.sample(pop, 2)
-            child = p1.copy()
-            if rnd.random() < 0.5:
-                child[0] = p2[0]
-            if rnd.random() < 0.5:
-                child[1] = p2[1]
-            # 轻微变异
-            if rnd.random() < 0.1:
-                child[0] = rnd.randrange(0, len(inst_list))
-            if rnd.random() < 0.1:
-                child[1] = rnd.randrange(0, len(modes))
+        # Crossover + mutation
+        offspring: List[int] = []
+        while len(offspring) < len(pop):
+            p1 = rnd.choice(pop)
+            p2 = rnd.choice(pop)
+            child = p1 if rnd.random() < 0.5 else p2
+            if rnd.random() < 0.15:
+                child = rand_ind()
             offspring.append(child)
 
-        # 合并父代+子代，重新选择 pop_size 个
         combined = pop + offspring
-        combined_objs = [eval_ind(ind) for ind in combined]
+        combined_objs = [eval_ind(i) for i in combined]
         fronts, _ = _fast_non_dominated_sort(combined_objs)
 
         new_pop = []
@@ -249,22 +265,18 @@ def nsga2_select(
 
         pop, pop_objs = new_pop, new_objs
 
-    # 在最终种群中选一个折衷解：对各维目标做简单加权
-    objs_arr = np.stack(pop_objs, axis=0)  # [P, 4]
-    # 对每一维做最小-最大归一化
-    min_vals = objs_arr.min(axis=0)
-    max_vals = objs_arr.max(axis=0)
-    span = np.maximum(max_vals - min_vals, 1e-9)
-    norm = (objs_arr - min_vals) / span
-    # 可以通过环境变量调整各目标权重
-    w_latency = float(os.getenv("NSGA_W_LATENCY", "0.4"))
-    w_comm = float(os.getenv("NSGA_W_COMM", "0.3"))
-    w_cost = float(os.getenv("NSGA_W_COST", "0.2"))
-    w_stall = float(os.getenv("NSGA_W_STALL", "0.1"))
-    weights = np.array([w_latency, w_comm, w_cost, w_stall], dtype=np.float32)
-    score = (norm * weights).sum(axis=1)
-    best_idx = int(score.argmin())
-    best_ind = pop[best_idx]
-    best_inst = inst_list[best_ind[0]]
-    best_mode = modes[best_ind[1]]
-    return best_inst, best_mode
+    # ------------------------------------------------------------
+    # 3) Final pick: normalize + weighted sum (latency + cost)
+    # ------------------------------------------------------------
+    objs = np.stack(pop_objs, axis=0)
+    minv = objs.min(axis=0)
+    maxv = objs.max(axis=0)
+    norm = (objs - minv) / np.maximum(maxv - minv, 1e-9)
+
+    w_latency = float(os.getenv("NSGA_W_LATENCY", "0.5"))
+    w_cost = float(os.getenv("NSGA_W_COST", "0.5"))
+
+    score = w_latency * norm[:, 0] + w_cost * norm[:, 2]
+    best_idx = int(np.argmin(score))
+    inst, mode = feasible_pairs[pop[best_idx]]
+    return inst, mode
