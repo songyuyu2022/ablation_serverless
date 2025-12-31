@@ -10,8 +10,9 @@
     "meta": {
       "desc": "Flagship GPU: Fast but Expensive",
       "device": "cuda",
-      "cold_start_ms": 100.0,
+      "cold_start_ms": 500.0,
       "rtt_ms": 1.0,
+      "bandwidth_mbps": 10000.0,
       "price_cents_s": 0.010,
       "performance": 2.5
     }
@@ -27,8 +28,9 @@
     "meta": {
       "desc": "Economy CPU: Cheap but Slow",
       "device": "cpu",
-      "cold_start_ms": 50.0,
+      "cold_start_ms": 200.0,
       "rtt_ms": 5.0,
+      "bandwidth_mbps": 1000.0,
       "price_cents_s": 0.0005,
       "performance": 0.5
     }
@@ -44,8 +46,9 @@
     "meta": {
       "desc": "Remote High-Compute",
       "device": "cpu",
-      "cold_start_ms": 300.0,
+      "cold_start_ms": 1200.0,
       "rtt_ms": 50.0,
+      "bandwidth_mbps": 500.0,
       "price_cents_s": 0.002,
       "performance": 1.5
     }
@@ -62,8 +65,9 @@
     "meta": {
       "desc": "Flagship GPU",
       "device": "cuda",
-      "cold_start_ms": 100.0,
+      "cold_start_ms": 500.0,
       "rtt_ms": 1.2,
+      "bandwidth_mbps": 10000.0,
       "price_cents_s": 0.010,
       "performance": 2.5
     }
@@ -79,8 +83,9 @@
     "meta": {
       "desc": "Economy CPU",
       "device": "cpu",
-      "cold_start_ms": 60.0,
+      "cold_start_ms": 220.0,
       "rtt_ms": 6.0,
+      "bandwidth_mbps": 1000.0,
       "price_cents_s": 0.0006,
       "performance": 0.6
     }
@@ -96,8 +101,9 @@
     "meta": {
       "desc": "Remote High-Compute",
       "device": "cpu",
-      "cold_start_ms": 350.0,
+      "cold_start_ms": 1300.0,
       "rtt_ms": 55.0,
+      "bandwidth_mbps": 500.0,
       "price_cents_s": 0.0022,
       "performance": 1.5
     }
@@ -114,8 +120,9 @@
     "meta": {
       "desc": "Expert 0 (GPU)",
       "device": "cuda",
-      "cold_start_ms": 200.0,
+      "cold_start_ms": 800.0,
       "rtt_ms": 1.5,
+      "bandwidth_mbps": 8000.0,
       "price_cents_s": 0.015,
       "performance": 3.0
     }
@@ -131,8 +138,9 @@
     "meta": {
       "desc": "Expert 0 (CPU)",
       "device": "cpu",
-      "cold_start_ms": 80.0,
+      "cold_start_ms": 250.0,
       "rtt_ms": 7.0,
+      "bandwidth_mbps": 1000.0,
       "price_cents_s": 0.001,
       "performance": 0.8
     }
@@ -148,8 +156,9 @@
     "meta": {
       "desc": "Expert 0 (Remote)",
       "device": "cpu",
-      "cold_start_ms": 500.0,
+      "cold_start_ms": 2000.0,
       "rtt_ms": 60.0,
+      "bandwidth_mbps": 400.0,
       "price_cents_s": 0.004,
       "performance": 1.5
     }
@@ -166,8 +175,9 @@
     "meta": {
       "desc": "Expert 1 (GPU)",
       "device": "cuda",
-      "cold_start_ms": 200.0,
+      "cold_start_ms": 800.0,
       "rtt_ms": 1.8,
+      "bandwidth_mbps": 8000.0,
       "price_cents_s": 0.015,
       "performance": 3.0
     }
@@ -183,8 +193,9 @@
     "meta": {
       "desc": "Expert 1 (CPU)",
       "device": "cpu",
-      "cold_start_ms": 40.0,
+      "cold_start_ms": 150.0,
       "rtt_ms": 8.0,
+      "bandwidth_mbps": 1000.0,
       "price_cents_s": 0.0012,
       "performance": 1.0
     }
@@ -200,8 +211,9 @@
     "meta": {
       "desc": "Expert 1 (Remote)",
       "device": "cpu",
-      "cold_start_ms": 450.0,
+      "cold_start_ms": 1900.0,
       "rtt_ms": 65.0,
+      "bandwidth_mbps": 400.0,
       "price_cents_s": 0.0042,
       "performance": 1.5
     }
@@ -218,8 +230,9 @@
     "meta": {
       "desc": "Expert 2 (CPU)",
       "device": "cpu",
-      "cold_start_ms": 90.0,
+      "cold_start_ms": 200.0,
       "rtt_ms": 6.0,
+      "bandwidth_mbps": 1000.0,
       "price_cents_s": 0.001,
       "performance": 0.8
     }
@@ -235,8 +248,9 @@
     "meta": {
       "desc": "Expert 2 (Remote)",
       "device": "cpu",
-      "cold_start_ms": 400.0,
+      "cold_start_ms": 1500.0,
       "rtt_ms": 70.0,
+      "bandwidth_mbps": 300.0,
       "price_cents_s": 0.003,
       "performance": 1.2
     }
@@ -253,8 +267,9 @@
   "meta": {
     "desc": "Expert 3 (CPU)",
     "device": "cpu",
-    "cold_start_ms": 85.0,
+    "cold_start_ms": 210.0,
     "rtt_ms": 5.5,
+    "bandwidth_mbps": 1000.0,
     "price_cents_s": 0.001,
     "performance": 0.8
   }
@@ -270,8 +285,9 @@
     "meta": {
       "desc": "Expert 3 (Remote)",
       "device": "cpu",
-      "cold_start_ms": 420.0,
+      "cold_start_ms": 1600.0,
       "rtt_ms": 75.0,
+      "bandwidth_mbps": 300.0,
       "price_cents_s": 0.003,
       "performance": 1.2
     }

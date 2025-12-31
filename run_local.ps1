@@ -88,15 +88,29 @@ $AblationModes = @(
 $env:TOP_K='2'; $env:NUM_EXPERTS='4'
 $env:VOCAB_SIZE='2000'; $env:EMB_DIM='256'
 $env:BATCH_SIZE='8'; $env:BLOCK_SIZE='64'
-$env:MAX_STEPS='2200'; $env:VAL_INTERVAL='100'; $env:LOG_TRAIN_EVERY='10'
+$env:MAX_STEPS='800'; $env:VAL_INTERVAL='100'; $env:LOG_TRAIN_EVERY='10'
 $env:MICRO_BATCHES="4"; $env:PARALLEL_DEGREE="4"
 
+
 # 动态/网络参数
-$env:HOTSPOT_DRIFT_EVERY="20"; $env:HOTSPOT_SPAN="3"; $env:HOT_PROB="0.80"; $env:WARM_PROB="0.10"
-$env:GRAD_HOT_PROB="0.85"; $env:GRAD_COLD_PROB="0.85"
+# [修改] 漂移周期从 20 改为 100，给冷专家足够的时间"变冷"
+$env:HOTSPOT_DRIFT_EVERY="100"
+$env:HOTSPOT_SPAN="1"
+# [修改] 提高热点概率，配合 controller.py 中的强制隔离逻辑
+$env:HOT_PROB="0.85"
+$env:WARM_PROB="0.10"
+
+# [新增] 核心修改：使用 Step 计数保活，而非物理时间。
+# 设为 5 表示：只要 5 个 Step 没被调用，实例就变冷。
+$env:KEEP_ALIVE_STEPS="5"
+
+# 梯度通信概率 (保持不变或微调)
+$env:GRAD_HOT_PROB="0.90"
+$env:GRAD_COLD_PROB="0.90"
+
+# 自动扩缩容与 Deadline (保持不变)
 $env:AUTOSCALE_ENABLE="1"; $env:AUTOSCALE_QUEUE_TH_MS="30"; $env:AUTOSCALE_MAX_REPLICA="6"; $env:AUTOSCALE_COOLDOWN_STEPS="8"
 $env:DEADLINE_WARMUP_STEPS="30"; $env:DEADLINE_PCTL="95"; $env:DEADLINE_SAFETY="1.10"; $env:DEADLINE_MIN_MS="200"
-
 Write-Host ">>> Starting Ablation Loop: $AblationModes"
 
 foreach ($mode in $AblationModes) {
