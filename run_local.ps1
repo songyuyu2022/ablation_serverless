@@ -110,7 +110,7 @@ $env:GRAD_COLD_PROB="0.90"
 
 # 自动扩缩容与 Deadline (保持不变)
 $env:AUTOSCALE_ENABLE="1"; $env:AUTOSCALE_QUEUE_TH_MS="30"; $env:AUTOSCALE_MAX_REPLICA="6"; $env:AUTOSCALE_COOLDOWN_STEPS="8"
-$env:DEADLINE_WARMUP_STEPS="30"; $env:DEADLINE_PCTL="95"; $env:DEADLINE_SAFETY="1.10"; $env:DEADLINE_MIN_MS="200"
+$env:DEADLINE_WARMUP_STEPS="30"; $env:DEADLINE_PCTL="95"; $env:DEADLINE_SAFETY="1.10"; $env:DEADLINE_MIN_MS="200";$env:INVOKE_RETRIES="20"
 Write-Host ">>> Starting Ablation Loop: $AblationModes"
 
 foreach ($mode in $AblationModes) {

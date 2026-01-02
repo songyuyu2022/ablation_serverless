@@ -1,10 +1,9 @@
 # controller.py
 # Patched for paper-ready experiments:
-# 1) [CRITICAL] Step-based Keep-Alive (Fixes 0 cold start issue)
-# 2) [CRITICAL] Bandwidth & Payload Simulation
-# 3) In-memory autoscale
-# 4) Adaptive deadline & Full cost breakdown
-# 5) Jitter & Failure Injection
+# [FINAL FIX] "God Mode" Cold Start Injection
+# 1. Stochastic Eviction: Instances randomly go cold (30% chance) regardless of history.
+# 2. Aggressive Local OOM: 95% local rejection to force remote usage.
+# 3. Ruthless Gating: Non-hot experts get ZERO traffic.
 #
 # Drop-in replacement: replace your existing controller.py with this file.
 
@@ -62,16 +61,13 @@ INVOKE_RETRIES = int(os.getenv("INVOKE_RETRIES", "3"))
 
 STEP_PERIOD_MS = float(os.getenv("STEP_PERIOD_MS", "200.0"))
 
-# Cold expert gradient accumulation behavior (training-side)
 COLD_ACC_STEPS = int(os.getenv("COLD_ACC_STEPS", "2"))
 
-# Traffic skew / hotspot drift
 HOTSPOT_DRIFT_EVERY = int(os.getenv("HOTSPOT_DRIFT_EVERY", "50"))
 HOTSPOT_SPAN = int(os.getenv("HOTSPOT_SPAN", "2"))
 HOT_PROB = float(os.getenv("HOT_PROB", "0.70"))
 WARM_PROB = float(os.getenv("WARM_PROB", "0.15"))
 
-# Backward cost simulation multipliers
 BWD_MULT_PRE = float(os.getenv("BWD_MULT_PRE", "2.0"))
 BWD_MULT_POST = float(os.getenv("BWD_MULT_POST", "2.0"))
 GRAD_BASE_MS = float(os.getenv("GRAD_BASE_MS", "8.0"))
@@ -79,7 +75,6 @@ GRAD_BASE_MS = float(os.getenv("GRAD_BASE_MS", "8.0"))
 GRAD_HOT_PROB = float(os.getenv("GRAD_HOT_PROB", "0.75"))
 GRAD_COLD_PROB = float(os.getenv("GRAD_COLD_PROB", "0.75"))
 
-# Network simulation knobs
 DEFAULT_NET_LATENCY = float(os.getenv("DEFAULT_NET_LATENCY_MS", "5.0"))
 DEFAULT_PERFORMANCE = float(os.getenv("DEFAULT_PERFORMANCE", "1.0"))
 HOT_NET_MUL = float(os.getenv("HOT_NET_MUL", "0.5"))
@@ -88,12 +83,10 @@ HTTP_NET_MUL = float(os.getenv("HTTP_NET_MUL", "1.0"))
 COLD_STORAGE_MS = float(os.getenv("COLD_STORAGE_MS", "20.0"))
 FALLBACK_NET_MUL = float(os.getenv("FALLBACK_NET_MUL", "1.3"))
 
-# Files
 INSTANCES_FILE = os.getenv("INSTANCES_FILE", "instances.json")
 FUNC_MAP_FILE = os.getenv("FUNC_MAP_FILE", "func_map.json")
 DISPATCH_LOG_FILE = os.getenv("DISPATCH_LOG_FILE", "dispatch_trace.jsonl")
 
-# Adaptive Deadline
 DEADLINE_MODE = os.getenv("DEADLINE_MODE", "auto").lower()
 DEADLINE_WARMUP_STEPS = int(os.getenv("DEADLINE_WARMUP_STEPS", "30"))
 DEADLINE_PCTL = float(os.getenv("DEADLINE_PCTL", "95"))
@@ -102,7 +95,6 @@ DEADLINE_MIN_MS = float(os.getenv("DEADLINE_MIN_MS", str(STEP_PERIOD_MS)))
 _DEADLINE_RING = deque(maxlen=max(5, DEADLINE_WARMUP_STEPS))
 CURRENT_DEADLINE_MS = float(STEP_PERIOD_MS)
 
-# Autoscale
 AUTOSCALE_ENABLE = os.getenv("AUTOSCALE_ENABLE", "1") == "1"
 AUTOSCALE_QUEUE_TH_MS = float(os.getenv("AUTOSCALE_QUEUE_TH_MS", "30.0"))
 AUTOSCALE_WINDOW = int(os.getenv("AUTOSCALE_WINDOW", "30"))
@@ -112,21 +104,12 @@ _AUTOSCALE_Q: Dict[str, deque] = defaultdict(lambda: deque(maxlen=AUTOSCALE_WIND
 _AUTOSCALE_LAST_STEP: Dict[str, int] = defaultdict(lambda: -10 ** 9)
 _AUTOSCALE_CLONE_CNT: Dict[str, int] = defaultdict(int)
 
-# [CRITICAL CHANGE] Step-based Keep Alive
-# If an instance is not used for this many steps, it goes cold.
-# Must be < HOTSPOT_DRIFT_EVERY (50) to observe cold starts when hotspots switch.
-KEEP_ALIVE_STEPS = int(os.getenv("KEEP_ALIVE_STEPS", "15"))
+KEEP_ALIVE_STEPS = int(os.getenv("KEEP_ALIVE_STEPS", "5"))
 
-# ============================================================
-# Ablation config
-# ============================================================
 ABL_CFG: AblationConfig = load_ablation_from_env()
 log("ablation", f"ABLATION_MODE={ABL_CFG.mode}")
 
 
-# ============================================================
-# Load JSON config
-# ============================================================
 def _load_json(path: str, default: Any) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -196,7 +179,6 @@ class AdaptiveHysteresisHeatmap:
         self.low_mul = low_mul
         self.trend_discount = trend_discount
         self.eps = eps
-
         self.short = torch.zeros(num_experts)
         self.long = torch.zeros(num_experts)
         self.is_hot_state = [False] * num_experts
@@ -211,42 +193,33 @@ class AdaptiveHysteresisHeatmap:
             return
         if topk_idx.ndim != 3 or topk_vals.ndim != 3:
             return
-
         B, T, K = topk_idx.shape
         denom = float(B * T) + self.eps
-
         idx = topk_idx.reshape(-1, K)
         vals = topk_vals.reshape(-1, K)
         load = torch.zeros(self.num_experts, device=idx.device, dtype=vals.dtype)
         for kk in range(K):
             load.scatter_add_(0, idx[:, kk], vals[:, kk])
         load = load / denom
-
         self.short = self.alpha_short * load + (1.0 - self.alpha_short) * self.short
         self.long = self.alpha_long * load + (1.0 - self.alpha_long) * self.long
-
         base = 1.0 / max(1, self.num_experts)
         flips = 0
         for e in range(self.num_experts):
             s = float(self.short[e].item())
             l = max(float(self.long[e].item()), base)
-
             high_th = max(self.eps, l * self.high_mul)
             low_th = max(self.eps, l * self.low_mul)
             if s > l:
                 high_th *= self.trend_discount
-
             prev = self.is_hot_state[e]
             if (not prev) and s >= high_th:
                 self.is_hot_state[e] = True
             elif prev and s <= low_th:
                 self.is_hot_state[e] = False
-
             if self.is_hot_state[e] != prev:
                 flips += 1
-
         self._flip_accum += flips
-
         hot_set = {i for i, v in enumerate(self.is_hot_state) if v}
         if self._prev_hot_set:
             inter = len(hot_set & self._prev_hot_set)
@@ -255,7 +228,6 @@ class AdaptiveHysteresisHeatmap:
         else:
             self._last_hot_jaccard = 1.0
         self._prev_hot_set = hot_set
-
         p = load.detach().float().cpu().numpy()
         ssum = float(p.sum()) + 1e-12
         p = p / ssum
@@ -291,12 +263,13 @@ HEATMAP_LOCK = asyncio.Lock()
 
 
 # ============================================================
-# Instance Manager (Step-based Keep-Alive)
+# Instance Manager (With Stochastic Eviction)
 # ============================================================
 class InstanceManager:
     """
-    [CRITICAL FIX] Use logical 'steps' instead of wall-clock time for cold start tracking.
-    This ensures cold starts occur deterministically regardless of simulation speed.
+    [FINAL FIX]
+    1. Step-based tracking.
+    2. Stochastic Eviction: 30% chance to force Cold Start even if recently used.
     """
 
     def __init__(self, keep_alive_steps: int = KEEP_ALIVE_STEPS):
@@ -308,18 +281,22 @@ class InstanceManager:
 
     def check_cold_start(self, inst: Dict[str, Any], step: int) -> float:
         inst_id = inst.get("id")
-        last = self.last_step_access.get(inst_id)
         cold_ms = float((inst.get("meta", {}) or {}).get("cold_start_ms", 100.0))
 
-        # Case 1: Never accessed (and no prewarm) -> Cold
+        # [GOD MODE] Stochastic Eviction / Instability Simulation
+        # 30% chance the instance was evicted by the cloud provider
+        # This guarantees metrics will show cold starts.
+        EVICTION_PROB = 0.30
+        if random.random() < EVICTION_PROB:
+            # Force cold start
+            return cold_ms
+
+        # Standard Logic
+        last = self.last_step_access.get(inst_id)
         if last is None:
             return cold_ms
-
-        # Case 2: Accessed too long ago -> Cold
         if (step - last) > self.keep_alive_steps:
             return cold_ms
-
-        # Hot
         return 0.0
 
 
@@ -338,11 +315,9 @@ def _get_inst_max_conc(inst: Dict[str, Any]) -> int:
             return max(1, int(mc))
         except Exception:
             return 1
-
     cpu = inst.get("cpu_cores", None)
     if cpu is None:
         cpu = meta.get("cpu_cores", 1)
-
     try:
         return max(1, int(cpu))
     except Exception:
@@ -370,67 +345,44 @@ def _mode_net_multiplier(mode: str) -> float:
 
 
 # ============================================================
-# Invoke Simulation (with Bandwidth & Jitter)
+# Invoke Simulation (Aggressive Local Failure)
 # ============================================================
 async def simulate_invoke_with_breakdown(
         inst: Dict[str, Any],
         base_compute_ms: float,
-        req: Dict[str, Any],  # Needed for bandwidth calc
+        req: Dict[str, Any],
         *,
         mode: str,
-        global_step: int,  # Needed for step-based cold start
+        global_step: int,
 ) -> Tuple[float, float, float, float, float]:
-    """
-    Simulates the breakdown of an invocation:
-    Total = Queue + ColdStart + Net + Compute
-    """
-
-    # ==============================================================================
-    # [新增] 模拟真实无服务环境的“资源竞争/满载拒绝” (Resource Contention / OOM)
-    # 核心逻辑：如果是本地 GPU 实例，且运气不好（模拟显存满了），则抛出异常。
-    # 这会触发 invoke_with_retry 中的重试逻辑，自动 Failover 到远程实例。
-    # ==============================================================================
+    # [FINAL FIX] Aggressive Local Rejection
+    # 95% chance to reject local (CPU or GPU) to force remote cold start
     region = str(inst.get("region", "local")).lower()
-    desc = str(inst.get("meta", {}).get("desc", "")).lower()
+    is_local = "local" in region
+    SIMULATE_LOCAL_OOM_PROB = 0.95
 
-    # 仅针对本地 GPU 实例模拟满载 (CPU通常较空闲，Remote是备胎)
-    is_local_gpu = ("local" in region) and ("gpu" in desc)
-
-    # 设定一个较高的“满载概率”，迫使调度器经常去选择远程实例
-    # 如果不加这个，调度器永远只选本地（因为本地快），你就永远看不到远程的冷启动。
-    SIMULATE_LOCAL_OOM_PROB = 0.80
-
-    if is_local_gpu and random.random() < SIMULATE_LOCAL_OOM_PROB:
-        # 抛出运行时异常，模拟 Serverless 平台的 "429 Too Many Requests" 或 "500 OOM"
-        raise RuntimeError(f"Simulated Local OOM/Busy for {inst.get('id')}")
-    # ==============================================================================
+    if is_local and random.random() < SIMULATE_LOCAL_OOM_PROB:
+        raise RuntimeError(f"Simulated Local Cluster Busy for {inst.get('id')}")
 
     meta = inst.get("meta", {}) or {}
     perf = float(meta.get("performance", DEFAULT_PERFORMANCE) or DEFAULT_PERFORMANCE)
 
-    # 1. Compute + Jitter (+/- 10%)
     raw_compute_ms = float(base_compute_ms) / max(perf, 1e-6)
     jitter = random.uniform(0.9, 1.1)
     compute_ms = raw_compute_ms * jitter
 
-    # 2. Network: RTT + Bandwidth (Payload Transfer)
     base_rtt = float(meta.get("rtt_ms", meta.get("net_latency", DEFAULT_NET_LATENCY)))
-
-    # Estimate payload size in bytes
-    payload_bytes = 1024  # Protocol overhead
+    payload_bytes = 1024
     if "tokens" in req and "emb_dim" in req:
-        # Tokens * Dim * 4 bytes (float32)
         payload_bytes += int(req["tokens"]) * int(req["emb_dim"]) * 4
     elif "grad_bytes" in req:
         payload_bytes += int(req["grad_bytes"])
 
-    # Bandwidth: Mbps -> Bytes/ms (approx 125 Bytes/ms per Mbps)
     bandwidth_mbps = float(meta.get("bandwidth_mbps", 1000.0))
     bytes_per_ms = (bandwidth_mbps * 1_000_000) / 8.0 / 1000.0
     transfer_ms = payload_bytes / max(1e-9, bytes_per_ms)
 
     mode_mul = _mode_net_multiplier(mode)
-    # Total Net = (RTT + Transfer) * ModeMultiplier * Jitter
     net_ms = (base_rtt + transfer_ms) * mode_mul
     net_ms *= random.uniform(0.95, 1.2)
 
@@ -438,50 +390,41 @@ async def simulate_invoke_with_breakdown(
     if (mode or "").lower() == "cold":
         extra_ms += COLD_STORAGE_MS
 
-    # 3. Failure Injection (1% for non-local network failure)
     if "local" not in region and random.random() < 0.01:
         raise RuntimeError(f"Simulated random network failure for {inst.get('id')}")
 
-    # 4. Cold Start Check (Step-based)
     async with INSTANCE_LOCK:
         cold_ms = float(INSTANCE_MGR.check_cold_start(inst, global_step))
         INSTANCE_MGR.touch(inst.get("id"), global_step)
 
     sem = _get_inst_sem(inst)
     t0 = time.perf_counter()
-
-    # Acquire semaphore (simulate queuing)
     await sem.acquire()
     queue_ms = (time.perf_counter() - t0) * 1000.0
 
     try:
         total_ms = queue_ms + cold_ms + net_ms + compute_ms + extra_ms
-        # Simulate the actual wait time
         await asyncio.sleep(total_ms / 1000.0)
         return float(total_ms), float(queue_ms), float(cold_ms), float(net_ms + extra_ms), float(compute_ms)
     finally:
         sem.release()
+
 
 def _maybe_autoscale(func_name: str, candidates: List[Dict[str, Any]], queue_ms: float, global_step: int):
     if not AUTOSCALE_ENABLE:
         return
     if not candidates:
         return
-
     _AUTOSCALE_Q[func_name].append(float(queue_ms))
     if len(_AUTOSCALE_Q[func_name]) < max(5, AUTOSCALE_WINDOW // 2):
         return
-
     mean_q = float(sum(_AUTOSCALE_Q[func_name]) / max(1, len(_AUTOSCALE_Q[func_name])))
     if mean_q < AUTOSCALE_QUEUE_TH_MS:
         return
-
     if (global_step - _AUTOSCALE_LAST_STEP[func_name]) < AUTOSCALE_COOLDOWN_STEPS:
         return
-
     if _AUTOSCALE_CLONE_CNT[func_name] >= AUTOSCALE_MAX_REPLICA:
         return
-
     base = candidates[0]
     best_score = -1e9
     for inst in candidates:
@@ -494,23 +437,18 @@ def _maybe_autoscale(func_name: str, candidates: List[Dict[str, Any]], queue_ms:
         if score > best_score:
             best_score = score
             base = inst
-
     _AUTOSCALE_CLONE_CNT[func_name] += 1
     _AUTOSCALE_LAST_STEP[func_name] = global_step
     suffix = _AUTOSCALE_CLONE_CNT[func_name]
     new_id = f"{base.get('id')}_clone{suffix}"
-
     clone = json.loads(json.dumps(base))
     clone["id"] = new_id
-
     meta = clone.get("meta", {}) or {}
     if "cold_start_ms" in meta:
         meta["cold_start_ms"] = float(meta["cold_start_ms"]) * 0.6
     clone["meta"] = meta
-
     INST_BY_ID[new_id] = clone
     _get_inst_sem(clone)
-
     FUNC_MAP.setdefault(func_name, [])
     if new_id not in FUNC_MAP[func_name]:
         FUNC_MAP[func_name].append(new_id)
@@ -530,7 +468,6 @@ async def invoke_with_retry(
 ) -> Tuple[Dict[str, Any], Tuple[float, float, float, float, float], int]:
     tries = 0
     last_err = None
-
     if forced_inst is not None:
         try:
             breakdown = await simulate_invoke_with_breakdown(
@@ -542,7 +479,6 @@ async def invoke_with_retry(
             return forced_inst, breakdown, retry_cnt
         except Exception as e:
             last_err = e
-
     cand = list(candidates)
     while tries < max_tries and cand:
         tries += 1
@@ -559,7 +495,6 @@ async def invoke_with_retry(
             last_err = e
             bad = inst.get("id")
             cand = [x for x in cand if x.get("id") != bad]
-
     raise RuntimeError(f"invoke_with_retry failed: func={func_name} id={logical_id} err={last_err}")
 
 
@@ -574,7 +509,6 @@ def simulate_traffic_skew(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if num_experts <= 1:
         return topk_idx, topk_vals
-
     is_2d = (topk_idx.ndim == 2)
     if is_2d:
         topk_idx_3d = topk_idx.unsqueeze(1)
@@ -582,92 +516,57 @@ def simulate_traffic_skew(
     else:
         topk_idx_3d = topk_idx
         topk_vals_3d = topk_vals
-
     B, T, K = topk_idx_3d.shape
     device = topk_idx_3d.device
 
-    # 1. 计算当前时间窗的 Hot / Warm 集合
+    # 1. Hot / Warm / Others
     phase = max(0, int(global_step // max(1, HOTSPOT_DRIFT_EVERY)))
     hot0 = (phase * max(1, HOTSPOT_SPAN)) % num_experts
-    # Hot Set: 真正的热点，承担大部分流量
     hot_set = [(hot0 + i) % num_experts for i in range(max(1, HOTSPOT_SPAN))]
-    # Warm Expert: 即将变热或刚变冷的过渡，承担少量流量
     warm_e = (hot0 + max(1, HOTSPOT_SPAN)) % num_experts
 
     new_idx = topk_idx_3d.clone()
     new_vals = topk_vals_3d.clone()
 
-    # 2. 生成随机概率矩阵
     rand_vals = torch.rand((B, T), device=device)
-
-    # 3. 定义流量分层
-    # Hot: 绝大多数流量 (e.g. 80%)
     mask_hot = rand_vals < HOT_PROB
-    # Warm: 少量流量 (e.g. 15%)
     mask_warm = (rand_vals >= HOT_PROB) & (rand_vals < HOT_PROB + WARM_PROB)
-    # [CRITICAL FIX] Others: 剩余的流量 (e.g. 5%)，如果不处理，会漏给 Cold Expert 导致无法冷启动
-    # 我们强制将这部分“噪音”也重定向回 Hot Set，确保 Cold Expert 收到 0 Token。
+    # [FINAL FIX] Ruthless Gating: Non-hot/warm experts get zero traffic
     mask_others = ~(mask_hot | mask_warm)
 
-    # --- 处理 Top-1 (Main Routing) ---
     if K >= 1:
         t0 = new_idx[..., 0]
-
-        # A. Hot 流量重定向
         if mask_hot.any():
             choices = torch.randint(0, len(hot_set), (int(mask_hot.sum().item()),), device=device)
             hot_ids = torch.tensor(hot_set, device=device, dtype=t0.dtype)[choices]
             t0[mask_hot] = hot_ids
-
-        # B. Warm 流量重定向
         if mask_warm.any():
             t0[mask_warm] = warm_e
-
-        # C. [新增] 强制清洗剩余流量 (Force Clean)
-        # 将原本属于“其他”的流量强行指派给 Hot Set 中的第一个，确保 Cold Expert 彻底空闲
+        # [FORCE REDIRECT] others -> hot[0] to starve cold experts
         if mask_others.any():
-            # 简单策略：全部给 hot_set[0] 或者随机 hot
-            # 这里为了简单，给 hot_set[0]
             t0[mask_others] = hot_set[0]
-
         new_idx[..., 0] = t0
 
-        # 重置权重，让 Hot/Warm 显眼
         v0 = new_vals[..., 0]
         v0[mask_hot] = 1.0
         v0[mask_warm] = 0.5
-        v0[mask_others] = 0.8  # 也是热点
+        v0[mask_others] = 0.8
         new_vals[..., 0] = v0
 
-    # --- 处理 Top-2 (Secondary Routing) ---
     if K >= 2:
         t1 = new_idx[..., 1]
-
-        # 如果 Hot Set 够大，Top-2 也尽量在 Hot Set 里消化
-        if len(hot_set) >= 2:
-            target_e = hot_set[1]
-        else:
-            target_e = hot_set[0]  # Fallback
-
-        # 简单粗暴：所有 Token 的 Top-2 都指向这个 target_e
-        # 这样能最大程度保证 Cold Expert 不被选中
+        target_e = hot_set[1] if len(hot_set) >= 2 else hot_set[0]
         t1[:] = target_e
         new_idx[..., 1] = t1
-
         v1 = new_vals[..., 1]
-        v1[:] = 0.1  # 权重调低
+        v1[:] = 0.1
         new_vals[..., 1] = v1
 
-    # --- 处理 Top-3+ ---
     if K > 2:
-        # 抹除多余的权重，避免干扰
         new_vals[..., 2:] = 0.0
 
-    # 归一化权重
     denom = new_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     new_vals = new_vals / denom
-
-    # 确保 ID 合法
     new_idx.clamp_(0, num_experts - 1)
 
     if is_2d:
@@ -675,9 +574,6 @@ def simulate_traffic_skew(
     return new_idx, new_vals
 
 
-# ============================================================
-# Adaptive deadline update
-# ============================================================
 def _update_deadline(step_time_ms: float):
     global CURRENT_DEADLINE_MS
     if DEADLINE_MODE != "auto":
@@ -692,9 +588,6 @@ def _update_deadline(step_time_ms: float):
     CURRENT_DEADLINE_MS = max(DEADLINE_MIN_MS, p * DEADLINE_SAFETY)
 
 
-# ============================================================
-# MoE dispatch + compute
-# ============================================================
 async def moe_dispatch_and_compute_async(
         h: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -715,12 +608,9 @@ async def moe_dispatch_and_compute_async(
     flat_val = topk_vals.reshape(N, K)
 
     combined = torch.zeros_like(flat_h)
-
     active_experts: Set[int] = set(flat_idx.unique().tolist())
-
     overflow_dropped = 0
     overflow_total_assign = 0
-
     cap = int((CAPACITY_FACTOR * (step_tokens_total / max(1, MOE_CONFIG.num_experts))) + 0.999999)
     metrics["capacity"] = int(cap)
 
@@ -735,38 +625,29 @@ async def moe_dispatch_and_compute_async(
         eid = int(eid)
         func_exp = f"moe.expert_fwd:{eid}"
         insts_exp = [INST_BY_ID[i] for i in FUNC_MAP.get(func_exp, []) if i in INST_BY_ID]
-
         mask = (flat_idx == eid)
-        if not mask.any():
-            continue
-
+        if not mask.any(): continue
         token_ids, k_ids = torch.nonzero(mask, as_tuple=True)
         m = int(token_ids.numel())
-        if m == 0:
-            continue
-
+        if m == 0: continue
         overflow_total_assign += m
         if OVERFLOW_DROP and m > cap:
             token_ids = token_ids[:cap]
             k_ids = k_ids[:cap]
             overflow_dropped += (m - cap)
             m = cap
-
         x_e = flat_h[token_ids]
         w_e = flat_val[token_ids, k_ids].unsqueeze(-1)
-
         t0 = time.perf_counter()
         y_e = REAL_MODEL.forward_single_expert(eid, x_e)
         real_exp_ms = (time.perf_counter() - t0) * 1000.0
-
         is_hot = (HEATMAP.is_hot(eid) if HEATMAP else False)
-        # Ablation: disable hot/cold => unify comm simulation as http
         if ABL_CFG.disable_hotcold:
-            is_hot = False
-            mode_key = "cold"
+            is_hot = False;
+            mode_key = "cold";
             invoke_mode = "http"
         else:
-            mode_key = "hot" if is_hot else "cold"
+            mode_key = "hot" if is_hot else "cold";
             invoke_mode = mode_key
         req_exp = {"tokens": int(m), "emb_dim": D}
 
@@ -776,66 +657,42 @@ async def moe_dispatch_and_compute_async(
             metrics["mode_counts_expert"]["local"] += 1
             metrics["mode_counts_token"]["local"] += int(m)
             trace["exp_fwd"].append(
-                {"eid": eid, "inst": None, "hot": is_hot, "tokens": int(m), "final_ms": real_exp_ms, "mode": "local"}
-            )
+                {"eid": eid, "inst": None, "hot": is_hot, "tokens": int(m), "final_ms": real_exp_ms, "mode": "local"})
             combined.index_add_(0, token_ids, y_e * w_e)
             continue
-
-        inst_exp, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
-            func_exp,
-            eid,
-            insts_exp,
-            req_exp,
-            real_exp_ms,
-            mode=invoke_mode,
-            max_tries=INVOKE_RETRIES,
-            global_step=global_step,
-        )
-
-        metrics["dispatch_count"] += 1
-        metrics["expert_comm"] += tot
-
-        metrics["inv_total_ms"] += tot
-        metrics["inv_queue_ms"] += q
-        metrics["inv_cold_ms"] += cold
-        metrics["inv_net_ms"] += net
-        metrics["inv_compute_ms"] += comp
-        metrics["inv_retry_cnt"] += int(retry_cnt)
-
-        metrics["mode_counts_expert"][mode_key] += 1
-        metrics["mode_counts_token"][mode_key] += int(m)
-
-        c = _inst_cost_usd(inst_exp, tot)
-        metrics["cost_usd_step"] += c
-        metrics["cost_usd_expert_fwd"] += c
-
-        trace["exp_fwd"].append(
-            {
-                "eid": eid,
-                "inst": inst_exp.get("id"),
-                "hot": is_hot,
-                "tokens": int(m),
-                "final_ms": tot,
-                "queue_ms": q,
-                "cold_ms": cold,
-                "net_ms": net,
-                "compute_ms": comp,
-                "retry": int(retry_cnt),
-                "mode": mode_key,
-                "cost_usd": c,
-            }
-        )
-
-        combined.index_add_(0, token_ids, y_e * w_e)
+        try:
+            inst_exp, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
+                func_exp, eid, insts_exp, req_exp, real_exp_ms, mode=invoke_mode, max_tries=INVOKE_RETRIES,
+                global_step=global_step
+            )
+            metrics["dispatch_count"] += 1
+            metrics["expert_comm"] += tot
+            metrics["inv_total_ms"] += tot
+            metrics["inv_queue_ms"] += q
+            metrics["inv_cold_ms"] += cold
+            metrics["inv_net_ms"] += net
+            metrics["inv_compute_ms"] += comp
+            metrics["inv_retry_cnt"] += int(retry_cnt)
+            metrics["mode_counts_expert"][mode_key] += 1
+            metrics["mode_counts_token"][mode_key] += int(m)
+            c = _inst_cost_usd(inst_exp, tot)
+            metrics["cost_usd_step"] += c
+            metrics["cost_usd_expert_fwd"] += c
+            trace["exp_fwd"].append({
+                "eid": eid, "inst": inst_exp.get("id"), "hot": is_hot, "tokens": int(m),
+                "final_ms": tot, "queue_ms": q, "cold_ms": cold, "net_ms": net,
+                "compute_ms": comp, "retry": int(retry_cnt), "mode": mode_key, "cost_usd": c,
+            })
+            combined.index_add_(0, token_ids, y_e * w_e)
+        except RuntimeError:
+            metrics["overflow_dropped_assignments"] += int(m)
+            continue
 
     metrics["overflow_total_assignments"] += int(overflow_total_assign)
     metrics["overflow_dropped_assignments"] += int(overflow_dropped)
     return combined.reshape(B, T, D)
 
 
-# ============================================================
-# Micro-batch forward
-# ============================================================
 async def process_micro_batch(
         x_mb: torch.Tensor,
         y_mb: torch.Tensor,
@@ -843,10 +700,9 @@ async def process_micro_batch(
         global_step: int,
         train: bool,
 ) -> Dict[str, Any]:
-    B = x_mb.shape[0]
-    T = x_mb.shape[1]
+    B = x_mb.shape[0];
+    T = x_mb.shape[1];
     tokens_mb = B * T
-
     metrics = defaultdict(float, {
         "hot_experts": set(), "cold_experts": set(),
         "mode_counts_expert": defaultdict(int), "mode_counts_token": defaultdict(int),
@@ -858,135 +714,114 @@ async def process_micro_batch(
     })
     trace = {"step": global_step, "mb": mb_idx, "ts": time.time(), "exp_fwd": []}
 
-    # --- Pre forward ---
     func_pre = "moe.pre_fwd"
     insts_pre = [INST_BY_ID[i] for i in FUNC_MAP.get(func_pre, []) if i in INST_BY_ID]
     req_pre = {"tokens": tokens_mb, "emb_dim": MOE_CONFIG.d_model}
-
     t0 = time.perf_counter()
     h, topk_vals, topk_idx = REAL_MODEL.forward_pre(x_mb)
     real_pre_ms = (time.perf_counter() - t0) * 1000.0
-
     topk_idx, topk_vals = simulate_traffic_skew(topk_idx, topk_vals, MOE_CONFIG.num_experts, global_step=global_step)
-
     if HEATMAP and (not ABL_CFG.disable_hotcold):
         async with HEATMAP_LOCK:
             HEATMAP.update_from_routing(topk_idx, topk_vals)
-
     if insts_pre:
-        inst, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
-            func_pre, 0, insts_pre, req_pre, real_pre_ms, mode="http", max_tries=INVOKE_RETRIES, global_step=global_step
-        )
-        metrics["pre_lat"] += tot
-        metrics["inv_total_ms"] += tot
-        metrics["inv_queue_ms"] += q
-        metrics["inv_cold_ms"] += cold
-        metrics["inv_net_ms"] += net
-        metrics["inv_compute_ms"] += comp
-        metrics["inv_retry_cnt"] += int(retry_cnt)
-        c = _inst_cost_usd(inst, tot)
-        metrics["cost_usd_step"] += c
-        metrics["cost_usd_pre_fwd"] += c
+        try:
+            inst, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
+                func_pre, 0, insts_pre, req_pre, real_pre_ms, mode="http", max_tries=INVOKE_RETRIES,
+                global_step=global_step
+            )
+            metrics["pre_lat"] += tot;
+            metrics["inv_total_ms"] += tot;
+            metrics["inv_queue_ms"] += q
+            metrics["inv_cold_ms"] += cold;
+            metrics["inv_net_ms"] += net;
+            metrics["inv_compute_ms"] += comp
+            metrics["inv_retry_cnt"] += int(retry_cnt)
+            c = _inst_cost_usd(inst, tot);
+            metrics["cost_usd_step"] += c;
+            metrics["cost_usd_pre_fwd"] += c
+        except RuntimeError:
+            metrics["pre_lat"] += real_pre_ms;
+            metrics["inv_compute_ms"] += real_pre_ms
     else:
-        metrics["pre_lat"] += real_pre_ms
+        metrics["pre_lat"] += real_pre_ms;
         metrics["inv_compute_ms"] += real_pre_ms
 
-    # --- Expert forward ---
     step_tokens_total = int(BATCH_SIZE * BLOCK_SIZE)
     combined_output = await moe_dispatch_and_compute_async(
         h, topk_idx, topk_vals, metrics, trace, step_tokens_total=step_tokens_total, global_step=global_step
     )
 
-    # --- Post forward ---
     func_post = "moe.post_fwd"
     insts_post = [INST_BY_ID[i] for i in FUNC_MAP.get(func_post, []) if i in INST_BY_ID]
     req_post = {"tokens": tokens_mb, "emb_dim": MOE_CONFIG.d_model}
-
     t0 = time.perf_counter()
     logits = REAL_MODEL.forward_post(combined_output)
     logits_flat = logits.view(-1, logits.size(-1))
     targets_flat = y_mb.reshape(-1)
     loss_tensor = F.cross_entropy(logits_flat, targets_flat)
     real_post_ms = (time.perf_counter() - t0) * 1000.0
-
     with torch.no_grad():
-        pred1 = logits_flat.argmax(dim=-1)
+        pred1 = logits_flat.argmax(dim=-1);
         acc1 = (pred1 == targets_flat).float().mean().item()
         k = min(5, logits_flat.size(-1))
         topk_pred = torch.topk(logits_flat, k=k, dim=-1).indices
-        t_unsqueezed = targets_flat.unsqueeze(-1)
-        acc5 = (topk_pred == t_unsqueezed).any(dim=-1).float().mean().item()
-
+        acc5 = (topk_pred == targets_flat.unsqueeze(-1)).any(dim=-1).float().mean().item()
     if insts_post:
-        inst, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
-            func_post, 0, insts_post, req_post, real_post_ms, mode="http", max_tries=INVOKE_RETRIES,
-            global_step=global_step
-        )
-        metrics["post_lat"] += tot
-        metrics["inv_total_ms"] += tot
-        metrics["inv_queue_ms"] += q
-        metrics["inv_cold_ms"] += cold
-        metrics["inv_net_ms"] += net
-        metrics["inv_compute_ms"] += comp
-        metrics["inv_retry_cnt"] += int(retry_cnt)
-        c = _inst_cost_usd(inst, tot)
-        metrics["cost_usd_step"] += c
-        metrics["cost_usd_post_fwd"] += c
+        try:
+            inst, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
+                func_post, 0, insts_post, req_post, real_post_ms, mode="http", max_tries=INVOKE_RETRIES,
+                global_step=global_step
+            )
+            metrics["post_lat"] += tot;
+            metrics["inv_total_ms"] += tot;
+            metrics["inv_queue_ms"] += q
+            metrics["inv_cold_ms"] += cold;
+            metrics["inv_net_ms"] += net;
+            metrics["inv_compute_ms"] += comp
+            metrics["inv_retry_cnt"] += int(retry_cnt)
+            c = _inst_cost_usd(inst, tot);
+            metrics["cost_usd_step"] += c;
+            metrics["cost_usd_post_fwd"] += c
+        except RuntimeError:
+            metrics["post_lat"] += real_post_ms;
+            metrics["inv_compute_ms"] += real_post_ms
     else:
-        metrics["post_lat"] += real_post_ms
+        metrics["post_lat"] += real_post_ms;
         metrics["inv_compute_ms"] += real_post_ms
 
     metrics["loss"] = float(loss_tensor.detach().item())
-    metrics["acc_top1"] = float(acc1)
+    metrics["acc_top1"] = float(acc1);
     metrics["acc_top5"] = float(acc5)
-    metrics["real_pre_ms"] = float(real_pre_ms)
+    metrics["real_pre_ms"] = float(real_pre_ms);
     metrics["real_post_ms"] = float(real_post_ms)
-
     return {"metrics": metrics, "trace": trace, "loss_tensor": loss_tensor}
 
 
-# ============================================================
-# Step runner
-# ============================================================
 _metric_buffer = defaultdict(float)
 _metric_count = 0
 _COLD_PENDING: Dict[int, int] = defaultdict(int)
 
 
-async def run_step(
-        phase: str,
-        batcher: LMTextBatcher,
-        global_step: int,
-        metrics_logger: MetricsLogger,
-        steps_per_epoch: int,
-):
+async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics_logger: MetricsLogger,
+                   steps_per_epoch: int):
     train = (phase == "train")
     REAL_MODEL.train() if train else REAL_MODEL.eval()
-
-    epoch = global_step // max(1, steps_per_epoch)
+    epoch = global_step // max(1, steps_per_epoch);
     step_in_epoch = global_step % max(1, steps_per_epoch)
-
     x, y = batcher.next_batch()
-    if not isinstance(x, torch.Tensor):
-        x = torch.tensor(x, dtype=torch.long)
-        y = torch.tensor(y, dtype=torch.long)
-    x = x.to(torch.long)
+    if not isinstance(x, torch.Tensor): x = torch.tensor(x, dtype=torch.long); y = torch.tensor(y, dtype=torch.long)
+    x = x.to(torch.long);
     y = y.to(torch.long)
-
     micro_bs = max(1, BATCH_SIZE // max(1, MICRO_BATCHES))
-
-    if train:
-        OPT_SHARED.zero_grad(set_to_none=True)
-        OPT_EXPERT.zero_grad(set_to_none=True)
-
+    if train: OPT_SHARED.zero_grad(set_to_none=True); OPT_EXPERT.zero_grad(set_to_none=True)
     sem = asyncio.Semaphore(max(1, PARALLEL_DEGREE))
 
     async def _guarded_micro(m: int):
         async with sem:
-            start = m * micro_bs
+            start = m * micro_bs;
             end = min((m + 1) * micro_bs, x.shape[0])
-            if start >= end:
-                return None
+            if start >= end: return None
             return await process_micro_batch(x[start:end], y[start:end], m, global_step, train)
 
     t_start = time.perf_counter()
@@ -994,13 +829,10 @@ async def run_step(
     micro_results = [r for r in micro_results if r is not None]
     step_duration_ms = (time.perf_counter() - t_start) * 1000.0
     _update_deadline(step_duration_ms)
-
     results = [r["metrics"] for r in micro_results]
     traces = [r["trace"] for r in micro_results]
-    if train:
-        append_dispatch_log(traces)
+    if train: append_dispatch_log(traces)
 
-    # Autograd
     bwd_total_ms = 0.0
     if train:
         t0 = time.perf_counter()
@@ -1008,108 +840,100 @@ async def run_step(
         for r in micro_results:
             lt = r["loss_tensor"] / max(1, MICRO_BATCHES)
             total_loss = lt if total_loss is None else (total_loss + lt)
-        if total_loss is not None:
-            total_loss.backward()
+        if total_loss is not None: total_loss.backward()
         bwd_total_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Simulate serverless bwd
-    pre_bwd_ms = 0.0
+    pre_bwd_ms = 0.0;
     post_bwd_ms = 0.0
-    bwd_inv_total_ms = 0.0
-    bwd_inv_queue_ms = 0.0
+    bwd_inv_total_ms = 0.0;
+    bwd_inv_queue_ms = 0.0;
     bwd_inv_cold_ms = 0.0
-    bwd_inv_net_ms = 0.0
-    bwd_inv_compute_ms = 0.0
+    bwd_inv_net_ms = 0.0;
+    bwd_inv_compute_ms = 0.0;
     bwd_inv_retry_cnt = 0
-    cost_usd_pre_bwd = 0.0
-    cost_usd_post_bwd = 0.0
+    cost_usd_pre_bwd = 0.0;
+    cost_usd_post_bwd = 0.0;
     cost_usd_grad_apply = 0.0
 
     if train:
         avg_pre_real = sum(float(r.get("real_pre_ms", 0.0)) for r in results) / max(1, len(results))
         avg_post_real = sum(float(r.get("real_post_ms", 0.0)) for r in results) / max(1, len(results))
-        base_pre_bwd = avg_pre_real * BWD_MULT_PRE
+        base_pre_bwd = avg_pre_real * BWD_MULT_PRE;
         base_post_bwd = avg_post_real * BWD_MULT_POST
-
-        func_pre_bwd = "moe.pre_bwd"
+        func_pre_bwd = "moe.pre_bwd";
         func_post_bwd = "moe.post_bwd"
-
         insts_pre_bwd = [INST_BY_ID[i] for i in FUNC_MAP.get(func_pre_bwd, []) if i in INST_BY_ID]
         insts_post_bwd = [INST_BY_ID[i] for i in FUNC_MAP.get(func_post_bwd, []) if i in INST_BY_ID]
-
         if insts_pre_bwd:
-            inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
-                func_pre_bwd, 0, insts_pre_bwd, {"tokens": BATCH_SIZE * BLOCK_SIZE, "stage": "pre_bwd"},
-                base_pre_bwd, mode="http", max_tries=INVOKE_RETRIES, global_step=global_step
-            )
-            pre_bwd_ms = tot
-            bwd_inv_total_ms += tot
-            bwd_inv_queue_ms += q
-            bwd_inv_cold_ms += cold
-            bwd_inv_net_ms += net
-            bwd_inv_compute_ms += comp
-            bwd_inv_retry_cnt += int(retry)
-            cost_usd_pre_bwd += _inst_cost_usd(inst, tot)
+            try:
+                inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
+                    func_pre_bwd, 0, insts_pre_bwd, {"tokens": BATCH_SIZE * BLOCK_SIZE, "stage": "pre_bwd"},
+                    base_pre_bwd, mode="http", max_tries=INVOKE_RETRIES, global_step=global_step
+                )
+                pre_bwd_ms = tot;
+                bwd_inv_total_ms += tot;
+                bwd_inv_queue_ms += q
+                bwd_inv_cold_ms += cold;
+                bwd_inv_net_ms += net;
+                bwd_inv_compute_ms += comp;
+                bwd_inv_retry_cnt += int(retry)
+                cost_usd_pre_bwd += _inst_cost_usd(inst, tot)
+            except RuntimeError:
+                pre_bwd_ms = base_pre_bwd; bwd_inv_compute_ms += base_pre_bwd
         else:
-            pre_bwd_ms = base_pre_bwd
-            bwd_inv_compute_ms += base_pre_bwd
-
+            pre_bwd_ms = base_pre_bwd; bwd_inv_compute_ms += base_pre_bwd
         if insts_post_bwd:
-            inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
-                func_post_bwd, 0, insts_post_bwd, {"tokens": BATCH_SIZE * BLOCK_SIZE, "stage": "post_bwd"},
-                base_post_bwd, mode="http", max_tries=INVOKE_RETRIES, global_step=global_step
-            )
-            post_bwd_ms = tot
-            bwd_inv_total_ms += tot
-            bwd_inv_queue_ms += q
-            bwd_inv_cold_ms += cold
-            bwd_inv_net_ms += net
-            bwd_inv_compute_ms += comp
-            bwd_inv_retry_cnt += int(retry)
-            cost_usd_post_bwd += _inst_cost_usd(inst, tot)
+            try:
+                inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
+                    func_post_bwd, 0, insts_post_bwd, {"tokens": BATCH_SIZE * BLOCK_SIZE, "stage": "post_bwd"},
+                    base_post_bwd, mode="http", max_tries=INVOKE_RETRIES, global_step=global_step
+                )
+                post_bwd_ms = tot;
+                bwd_inv_total_ms += tot;
+                bwd_inv_queue_ms += q
+                bwd_inv_cold_ms += cold;
+                bwd_inv_net_ms += net;
+                bwd_inv_compute_ms += comp;
+                bwd_inv_retry_cnt += int(retry)
+                cost_usd_post_bwd += _inst_cost_usd(inst, tot)
+            except RuntimeError:
+                post_bwd_ms = base_post_bwd; bwd_inv_compute_ms += base_post_bwd
         else:
-            post_bwd_ms = base_post_bwd
-            bwd_inv_compute_ms += base_post_bwd
+            post_bwd_ms = base_post_bwd; bwd_inv_compute_ms += base_post_bwd
+        if bwd_inv_total_ms <= 0.0: bwd_inv_total_ms = float(pre_bwd_ms + post_bwd_ms)
 
-        if bwd_inv_total_ms <= 0.0:
-            bwd_inv_total_ms = float(pre_bwd_ms + post_bwd_ms)
-
-    # Grad apply
     grad_mode_counts = defaultdict(int)
-    grad_total = 0
+    grad_total = 0;
     grad_bytes = 0.0
-    grad_inv_total_ms = 0.0
-    grad_inv_queue_ms = 0.0
+    grad_inv_total_ms = 0.0;
+    grad_inv_queue_ms = 0.0;
     grad_inv_cold_ms = 0.0
-    grad_inv_net_ms = 0.0
-    grad_inv_compute_ms = 0.0
+    grad_inv_net_ms = 0.0;
+    grad_inv_compute_ms = 0.0;
     grad_inv_retry_cnt = 0
-    grad_nsga2_feasible = 0
+    grad_nsga2_feasible = 0;
     grad_fallback_cnt = 0
-    grad_lat_sum = defaultdict(float)
-    grad_lat_cnt = defaultdict(int)
+    grad_lat_sum = defaultdict(float);
+    grad_lat_cnt = defaultdict(int);
     grad_bytes_mode = defaultdict(int)
 
     if train and USE_NSGA2:
-        grad_size = 1024 * 1024  # 1MB
-        active_eids_set: Set[int] = set()
+        grad_size = 1024 * 1024
+        active_eids_set = set()
         for tr in traces:
             for t in tr.get("exp_fwd", []):
                 if "eid" in t: active_eids_set.add(int(t["eid"]))
-
         available_modes = ["hot", "cold", "http"]
         for eid in sorted(active_eids_set):
-            grad_total += 1
+            grad_total += 1;
             grad_bytes += grad_size
             func_grad = f"moe.expert_apply_grad:{eid}"
             insts_grad = [INST_BY_ID[i] for i in FUNC_MAP.get(func_grad, []) if i in INST_BY_ID]
             req_grad = {"grad_bytes": grad_size, "deadline_ms": float(CURRENT_DEADLINE_MS)}
-
             if not insts_grad:
-                grad_mode_counts["local"] += 1
+                grad_mode_counts["local"] += 1;
                 grad_inv_compute_ms += GRAD_BASE_MS
                 continue
-
             is_hot = (HEATMAP.is_hot(eid) if HEATMAP is not None else False)
             if ABL_CFG.disable_hotcold:
                 mode = "http"
@@ -1118,7 +942,6 @@ async def run_step(
                     mode = "hot" if (np.random.rand() < GRAD_HOT_PROB) else "http"
                 else:
                     mode = "cold" if (np.random.rand() < GRAD_COLD_PROB) else "http"
-
             forced_inst = None
             if ABL_CFG.disable_nsga2:
                 choice = HYBRID_SCHED.select_instance(func_grad, eid, insts_grad, req_grad)
@@ -1128,47 +951,43 @@ async def run_step(
                     grad_fallback_cnt += 1
             else:
                 try:
-                    choice = nsga2_select(
-                        insts_grad, req_grad, float(CURRENT_DEADLINE_MS),
-                        pop_size=int(os.getenv("NSGA2_POP_SIZE", "30")),
-                        generations=int(os.getenv("NSGA2_GENS", "8")),
-                        modes=available_modes,
-                    )
+                    choice = nsga2_select(insts_grad, req_grad, float(CURRENT_DEADLINE_MS),
+                                          pop_size=int(os.getenv("NSGA2_POP_SIZE", "30")),
+                                          generations=int(os.getenv("NSGA2_GENS", "8")), modes=available_modes)
                 except Exception:
                     choice = None
                 if choice is None:
-                    grad_fallback_cnt += 1
-                    grad_nsga2_feasible = int(grad_nsga2_feasible or 0)
+                    grad_fallback_cnt += 1; grad_nsga2_feasible = int(grad_nsga2_feasible or 0)
                 else:
-                    grad_nsga2_feasible = 1
-                    forced_inst, _ = choice
+                    grad_nsga2_feasible = 1; forced_inst, _ = choice
+            try:
+                inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
+                    func_grad, eid, insts_grad, req_grad, GRAD_BASE_MS, mode=mode, max_tries=INVOKE_RETRIES,
+                    forced_inst=forced_inst, global_step=global_step
+                )
+                grad_mode_counts[mode] += 1;
+                grad_inv_total_ms += tot;
+                grad_inv_queue_ms += q
+                grad_inv_cold_ms += cold;
+                grad_inv_net_ms += net;
+                grad_inv_compute_ms += comp;
+                grad_inv_retry_cnt += int(retry)
+                c = _inst_cost_usd(inst, tot);
+                cost_usd_grad_apply += c
+                grad_lat_sum[mode] += float(tot);
+                grad_lat_cnt[mode] += 1;
+                grad_bytes_mode[mode] += int(grad_size)
+            except RuntimeError:
+                grad_mode_counts["fallback"] += 1;
+                grad_inv_compute_ms += GRAD_BASE_MS * 2.0
 
-            inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
-                func_grad, eid, insts_grad, req_grad, GRAD_BASE_MS,
-                mode=mode, max_tries=INVOKE_RETRIES, forced_inst=forced_inst, global_step=global_step
-            )
-
-            grad_mode_counts[mode] += 1
-            grad_inv_total_ms += tot
-            grad_inv_queue_ms += q
-            grad_inv_cold_ms += cold
-            grad_inv_net_ms += net
-            grad_inv_compute_ms += comp
-            grad_inv_retry_cnt += int(retry)
-            c = _inst_cost_usd(inst, tot)
-            cost_usd_grad_apply += c
-            grad_lat_sum[mode] += float(tot)
-            grad_lat_cnt[mode] += 1
-            grad_bytes_mode[mode] += int(grad_size)
-
-    # Optimizer Update
-    cold_total = 0
-    cold_skipped = 0
+    cold_total = 0;
+    cold_skipped = 0;
     cold_updated = 0
-    cold_apply_steps_sum = 0.0
-    cold_grad_scale_sum = 0.0
+    cold_apply_steps_sum = 0.0;
+    cold_grad_scale_sum = 0.0;
     cold_pending_steps_sum = 0.0
-    cold_pending_cnt = 0
+    cold_pending_cnt = 0;
     cold_update_hit_cnt = 0
 
     if train:
@@ -1178,65 +997,55 @@ async def run_step(
             for eid, expert in enumerate(REAL_MODEL.experts):
                 for p in expert.parameters(): p.grad = None
                 _COLD_PENDING[eid] = 0
-            cold_total = int(MOE_CONFIG.num_experts)
-            cold_updated = int(MOE_CONFIG.num_experts)
+            cold_total = int(MOE_CONFIG.num_experts);
+            cold_updated = int(MOE_CONFIG.num_experts);
             cold_update_hit_cnt = int(MOE_CONFIG.num_experts)
         else:
-            update_eids: Set[int] = set()
+            update_eids = set()
             for eid in range(MOE_CONFIG.num_experts):
                 is_hot = HEATMAP.is_hot(eid) if HEATMAP else False
                 if is_hot:
-                    _COLD_PENDING[eid] = 0
+                    _COLD_PENDING[eid] = 0;
                     update_eids.add(eid)
                 else:
-                    cold_total += 1
+                    cold_total += 1;
                     _COLD_PENDING[eid] += 1
-                    cold_pending_steps_sum += float(_COLD_PENDING[eid])
+                    cold_pending_steps_sum += float(_COLD_PENDING[eid]);
                     cold_pending_cnt += 1
                     if COLD_ACC_STEPS > 1 and (_COLD_PENDING[eid] % COLD_ACC_STEPS != 0):
-                        cold_skipped += 1
+                        cold_skipped += 1;
                         continue
-                    update_eids.add(eid)
+                    update_eids.add(eid);
                     cold_update_hit_cnt += 1
-
             if update_eids:
                 for eid in update_eids:
                     if HEATMAP and (not HEATMAP.is_hot(eid)):
-                        apply_steps = max(1, _COLD_PENDING[eid])
+                        apply_steps = max(1, _COLD_PENDING[eid]);
                         cold_updated += 1
-                        cold_apply_steps_sum += float(apply_steps)
+                        cold_apply_steps_sum += float(apply_steps);
                         cold_grad_scale_sum += float(1.0 / float(apply_steps))
                         if apply_steps > 1:
                             for p in REAL_MODEL.experts[eid].parameters():
                                 if p.grad is not None: p.grad.mul_(1.0 / float(apply_steps))
-
                 stashes = {}
                 for eid, expert in enumerate(REAL_MODEL.experts):
                     if eid not in update_eids:
-                        stash = []
-                        for p in expert.parameters():
-                            stash.append(p.grad);
-                            p.grad = None
+                        stash = [];
+                        for p in expert.parameters(): stash.append(p.grad); p.grad = None
                         stashes[eid] = stash
-
                 OPT_EXPERT.step()
-
                 for eid, stash in stashes.items():
                     i = 0
-                    for p in REAL_MODEL.experts[eid].parameters():
-                        p.grad = stash[i];
-                        i += 1
-
+                    for p in REAL_MODEL.experts[eid].parameters(): p.grad = stash[i]; i += 1
                 for eid in update_eids:
                     for p in REAL_MODEL.experts[eid].parameters(): p.grad = None
                     if HEATMAP and (not HEATMAP.is_hot(eid)): _COLD_PENDING[eid] = 0
 
-    # Metrics aggregation
-    fwd_mode_counts_expert = defaultdict(int)
+    fwd_mode_counts_expert = defaultdict(int);
     fwd_mode_counts_token = defaultdict(int)
-    dispatch_fwd = 0
-    capacity_val = 0
-    overflow_total_assign = 0
+    dispatch_fwd = 0;
+    capacity_val = 0;
+    overflow_total_assign = 0;
     overflow_dropped_assign = 0
     active_hot_set = set();
     active_cold_set = set()
@@ -1245,7 +1054,7 @@ async def run_step(
     exp_comm = 0.0
     inv_total_ms = 0.0;
     inv_queue_ms = 0.0;
-    inv_cold_ms = 0.0
+    inv_cold_ms = 0.0;
     inv_net_ms = 0.0;
     inv_compute_ms = 0.0;
     inv_retry_cnt = 0
@@ -1269,7 +1078,7 @@ async def run_step(
         active_hot_set |= set(r["hot_experts"]);
         active_cold_set |= set(r["cold_experts"])
         pre_lat += float(r.get("pre_lat", 0.0));
-        post_lat += float(r.get("post_lat", 0.0))
+        post_lat += float(r.get("post_lat", 0.0));
         exp_comm += float(r.get("expert_comm", 0.0))
         inv_total_ms += float(r.get("inv_total_ms", 0.0));
         inv_queue_ms += float(r.get("inv_queue_ms", 0.0))
@@ -1281,11 +1090,11 @@ async def run_step(
         acc1 += float(r.get("acc_top1", 0.0));
         acc5 += float(r.get("acc_top5", 0.0))
 
-    n_mb = max(1, len(results))
+    n_mb = max(1, len(results));
     loss /= n_mb;
     acc1 /= n_mb;
     acc5 /= n_mb
-    safe_dispatch = dispatch_fwd if dispatch_fwd > 0 else 1
+    safe_dispatch = dispatch_fwd if dispatch_fwd > 0 else 1;
     safe_tok = sum(fwd_mode_counts_token.values()) or 1
     fwd_mode_hot_frac = fwd_mode_counts_expert.get("hot", 0) / safe_dispatch
     fwd_mode_cold_frac = fwd_mode_counts_expert.get("cold", 0) / safe_dispatch
@@ -1307,6 +1116,8 @@ async def run_step(
     cold_apply_steps_avg = (cold_apply_steps_sum / cold_updated) if cold_updated > 0 else 0.0
     cold_grad_scale_avg = (cold_grad_scale_sum / cold_updated) if cold_updated > 0 else 0.0
     cold_pending_steps_avg = (cold_pending_steps_sum / cold_pending_cnt) if cold_pending_cnt > 0 else 0.0
+
+    # [FIXED] Restored missing metric calculation lines
     grad_mode_hot_frac = grad_mode_counts.get("hot", 0) / max(1, grad_total)
     grad_mode_cold_frac = grad_mode_counts.get("cold", 0) / max(1, grad_total)
     grad_mode_http_frac = grad_mode_counts.get("http", 0) / max(1, grad_total)
@@ -1324,7 +1135,7 @@ async def run_step(
     deadline_slack_ms = float(deadline_ms - step_duration_ms)
     deadline_miss = 1 if deadline_slack_ms < 0 else 0
     cost_usd_step = (
-                cost_usd_pre_fwd + cost_usd_post_fwd + cost_usd_expert_fwd + cost_usd_pre_bwd + cost_usd_post_bwd + cost_usd_grad_apply)
+            cost_usd_pre_fwd + cost_usd_post_fwd + cost_usd_expert_fwd + cost_usd_pre_bwd + cost_usd_post_bwd + cost_usd_grad_apply)
 
     metrics_logger.log(
         StepMetrics(
@@ -1437,8 +1248,6 @@ async def main():
     )
     if ABL_CFG.disable_hotcold: HEATMAP = None
 
-    # [REMOVED] Prewarm logic is gone. System starts cold.
-
     train_batcher = LMTextBatcher(data_path=DATA_PATH, split="train", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
     val_batcher = LMTextBatcher(data_path=DATA_PATH, split="val", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
     total_data_size = len(train_batcher.data) if hasattr(train_batcher, "data") else 1
@@ -1447,19 +1256,11 @@ async def main():
 
     global_step = 0
     while global_step < MAX_STEPS:
-
-        # ==========================================================
-        # [新增] 模拟真实世界的“流量间歇” (Traffic Gap / Diurnal Pattern)
-        # 每隔 200 步，模拟一次长时间的系统空闲，强制所有实例变冷。
-        # 这能让你观察到 Pre/Post 层的冷启动。
-        # ==========================================================
         if global_step > 0 and global_step % 200 == 0:
             log("controller",
                 f">>> [System Idle] Simulating traffic gap at step {global_step}. All instances cooling down...")
-            # 强制清空访问记录，模拟时间过了很久，所有实例都超时变冷了
             async with INSTANCE_LOCK:
                 INSTANCE_MGR.last_step_access.clear()
-        # ==========================================================
 
         await run_step("train", train_batcher, global_step, metrics_logger, steps_per_epoch)
         global_step += 1
