@@ -1,5 +1,5 @@
 # ============================================
-# run_ablation_all.ps1 — 自动化运行所有消融实验
+# run_ablation_all.ps1 - Automated Experiment Runner
 # ============================================
 
 Write-Host ">>> Activating virtual environment..."
@@ -15,7 +15,7 @@ $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Write-Host ">>> Project root = $ROOT"
 
 # --------------------------------------------
-# 1. 全局环境与目录准备
+# 1. Global Setup
 # --------------------------------------------
 $env:COMM_SIM_DIR        = "comm_sim"
 $env:INSTANCES_FILE      = "instances.json"
@@ -26,7 +26,7 @@ if (-not (Test-Path "$ROOT\comm_sim"))      { New-Item "$ROOT\comm_sim" -ItemTyp
 if (-not (Test-Path "$ROOT\comm_sim\hot"))  { New-Item "$ROOT\comm_sim\hot" -ItemType Directory | Out-Null }
 if (-not (Test-Path "$ROOT\comm_sim\cold")) { New-Item "$ROOT\comm_sim\cold" -ItemType Directory | Out-Null }
 
-# 定义启动新窗口的函数（用于后台服务）
+# Helper function to start background windows
 function Start-Window {
     param ( [string]$command )
     Start-Process powershell -ArgumentList @(
@@ -37,116 +37,229 @@ function Start-Window {
 }
 
 # --------------------------------------------
-# 2. 启动后台服务 (如果服务已在运行，请手动关闭旧窗口或跳过此步)
+# 2. Interactive Selection
 # --------------------------------------------
-Write-Host ">>> Starting background services (Pre/Post/Experts)..."
+Write-Host "`n================================================"
+Write-Host "   SELECT EXPERIMENT MODE"
+Write-Host "================================================"
+Write-Host " [1] Run Ours (My Method)"
+Write-Host "     Runs only 'full' mode for debugging."
+Write-Host ""
+Write-Host " [2] Run Ablation Variants"
+Write-Host "     Runs 'no_hotcold', 'sync_update' etc."
+Write-Host ""
+Write-Host " [3] Run Baseline Comparisons"
+Write-Host "     Runs 'round_robin', 'static', 'bsp' etc."
+Write-Host ""
+Write-Host " [4] Run ALL Experiments"
+Write-Host "     Sequence: Ours -> Ablation -> Baseline"
+Write-Host "================================================"
 
-# --- pre_fn (8001-8003) ---
-Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8001"
-Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8002"
-Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8003"
+$selection = Read-Host "Enter number (1/2/3/4) [Default: 1]"
+if ($selection -eq "") { $selection = "1" }
 
-# --- post_fn (8101-8103) ---
-Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8101"
-Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8102"
-Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8103"
+$RunOurs = $false
+$RunAblation = $false
+$RunBaseline = $false
 
-# --- Experts 0-3 (Ports 8201...8232) ---
-# Expert 0
-Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8201"
-Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8202"
-Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8203"
-# Expert 1
-Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8211"
-Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8212"
-Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8213"
-# Expert 2
-Start-Window -command "`$env:LOGICAL_EID='2'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8221"
-Start-Window -command "`$env:LOGICAL_EID='2'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8222"
-# Expert 3
-Start-Window -command "`$env:LOGICAL_EID='3'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8231"
-Start-Window -command "`$env:LOGICAL_EID='3'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8232"
-
-Write-Host ">>> Waiting 10 seconds for services to initialize..."
-Start-Sleep -Seconds 10
+switch ($selection) {
+    "1" {
+        $RunOurs = $true
+        Write-Host ">>> Selected: [Run Ours]" -ForegroundColor Cyan
+    }
+    "2" {
+        $RunAblation = $true
+        Write-Host ">>> Selected: [Run Ablation Variants]" -ForegroundColor Cyan
+    }
+    "3" {
+        $RunBaseline = $true
+        Write-Host ">>> Selected: [Run Baseline Comparisons]" -ForegroundColor Cyan
+    }
+    "4" {
+        $RunOurs = $true; $RunAblation = $true; $RunBaseline = $true
+        Write-Host ">>> Selected: [Run ALL]" -ForegroundColor Cyan
+    }
+    Default {
+        $RunOurs = $true
+        Write-Host ">>> Invalid input. Defaulting to: [Run Ours]" -ForegroundColor Yellow
+    }
+}
 
 # --------------------------------------------
-# 3. 循环运行所有消融实验 (Full Ablation Loop)
+# 3. Start Background Services
 # --------------------------------------------
+$startServices = Read-Host "`nStart background services (pre/post/experts)? (y/n) [Default: n]"
+if ($startServices -eq "y") {
+    Write-Host ">>> Starting background services..."
 
-# 定义所有需要运行的模式
-$AblationModes = @(
-    "full",            # 完整模式
-    "no_hotcold",      # 无冷热识别
-    "sync_update",     # 同步更新
-    "heuristic_only",  # 仅启发式调度
-    "predictor_only",  # 仅预测器调度
-    "no_nsga2"         # 无 NSGA-II
-)
+    # --- pre_fn (8001-8003) ---
+    Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8001"
+    Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8002"
+    Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8003"
 
-# 设置 Controller 通用参数
+    # --- post_fn (8101-8103) ---
+    Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8101"
+    Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8102"
+    Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8103"
+
+    # --- Experts 0-3 (Ports 8201...8232) ---
+    Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8201"
+    Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8202"
+    Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8203"
+
+    Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8211"
+    Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8212"
+    Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8213"
+
+    Start-Window -command "`$env:LOGICAL_EID='2'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8221"
+    Start-Window -command "`$env:LOGICAL_EID='2'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8222"
+
+    Start-Window -command "`$env:LOGICAL_EID='3'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8231"
+    Start-Window -command "`$env:LOGICAL_EID='3'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8232"
+
+    Write-Host ">>> Waiting 10 seconds for services to initialize..."
+    Start-Sleep -Seconds 10
+}
+
+# --------------------------------------------
+# 4. Common Configuration
+# --------------------------------------------
 $env:TOP_K='2'; $env:NUM_EXPERTS='4'
 $env:VOCAB_SIZE='2000'; $env:EMB_DIM='256'
 $env:BATCH_SIZE='8'; $env:BLOCK_SIZE='64'
 $env:MAX_STEPS='800'; $env:VAL_INTERVAL='100'; $env:LOG_TRAIN_EVERY='10'
 $env:MICRO_BATCHES="4"; $env:PARALLEL_DEGREE="4"
 
-
-# 动态/网络参数
-# [修改] 漂移周期从 20 改为 100，给冷专家足够的时间"变冷"
 $env:HOTSPOT_DRIFT_EVERY="100"
 $env:HOTSPOT_SPAN="1"
-# [修改] 提高热点概率，配合 controller.py 中的强制隔离逻辑
 $env:HOT_PROB="0.85"
 $env:WARM_PROB="0.10"
-
-# [新增] 核心修改：使用 Step 计数保活，而非物理时间。
-# 设为 5 表示：只要 5 个 Step 没被调用，实例就变冷。
 $env:KEEP_ALIVE_STEPS="5"
 
-# 梯度通信概率 (保持不变或微调)
 $env:GRAD_HOT_PROB="0.90"
 $env:GRAD_COLD_PROB="0.90"
 
-# 自动扩缩容与 Deadline (保持不变)
 $env:AUTOSCALE_ENABLE="1"; $env:AUTOSCALE_QUEUE_TH_MS="30"; $env:AUTOSCALE_MAX_REPLICA="6"; $env:AUTOSCALE_COOLDOWN_STEPS="8"
 $env:DEADLINE_WARMUP_STEPS="30"; $env:DEADLINE_PCTL="95"; $env:DEADLINE_SAFETY="1.10"; $env:DEADLINE_MIN_MS="200";$env:INVOKE_RETRIES="20"
-Write-Host ">>> Starting Ablation Loop: $AblationModes"
 
-foreach ($mode in $AblationModes) {
+# --------------------------------------------
+# 5. [Mode] Ours
+# --------------------------------------------
+if ($RunOurs) {
+    Write-Host "`n>>> Starting [Ours: My Method]..." -ForegroundColor Green
+
+    $mode = "full"
     Write-Host "--------------------------------------------------------"
-    Write-Host ">>> RUNNING MODE: $mode"
+    Write-Host ">>> [Ours] RUNNING MODE: $mode"
     Write-Host "--------------------------------------------------------"
 
-    # 1. 设置当前模式
+    $env:EXPERIMENT_TYPE = "ablation"
     $env:ABLATION_MODE = $mode
 
-    # 2. 阻塞运行 Controller (不使用 Start-Window，而是直接 python)
-    #    注意：这里假设 controller.py 会产生 metrics.csv 和 dispatch_trace.jsonl
-    python controller.py
+    Remove-Item Env:\BASELINE_MODE -ErrorAction SilentlyContinue
 
-    # 3. 备份数据 (避免下一次运行覆盖)
-    $timestamp = Get-Date -Format "yyyyMMdd-HHmm"
+    python controller.py
 
     if (Test-Path "metrics.csv") {
         $newMetricName = "metrics_${mode}.csv"
         Write-Host ">>> Renaming metrics.csv -> $newMetricName"
         Move-Item "metrics.csv" $newMetricName -Force
-    } else {
-        Write-Host "!!! Warning: metrics.csv not found for mode $mode"
     }
-
     if (Test-Path "dispatch_trace.jsonl") {
         $newTraceName = "trace_${mode}.jsonl"
         Write-Host ">>> Renaming dispatch_trace.jsonl -> $newTraceName"
         Move-Item "dispatch_trace.jsonl" $newTraceName -Force
     }
 
-    Write-Host ">>> Finished mode: $mode"
-    Write-Host "--------------------------------------------------------`n"
-
-    # 可选：休息几秒让系统冷却
-    Start-Sleep -Seconds 5
+    Start-Sleep -Seconds 3
 }
 
-Write-Host ">>> All ablation experiments finished!"
+# --------------------------------------------
+# 6. [Mode] Ablation Variants
+# --------------------------------------------
+if ($RunAblation) {
+    $AblationModes = @(
+        "no_hotcold",
+        "sync_update",
+        "heuristic_only",
+        "predictor_only",
+        "no_nsga2"
+    )
+
+    Write-Host "`n>>> Starting [Ablation Variants] Loop..." -ForegroundColor Green
+
+    foreach ($mode in $AblationModes) {
+        Write-Host "--------------------------------------------------------"
+        Write-Host ">>> [Ablation] RUNNING MODE: $mode"
+        Write-Host "--------------------------------------------------------"
+
+        $env:EXPERIMENT_TYPE = "ablation"
+        $env:ABLATION_MODE = $mode
+
+        Remove-Item Env:\BASELINE_MODE -ErrorAction SilentlyContinue
+
+        python controller.py
+
+        if (Test-Path "metrics.csv") {
+            $newMetricName = "metrics_${mode}.csv"
+            Write-Host ">>> Renaming metrics.csv -> $newMetricName"
+            Move-Item "metrics.csv" $newMetricName -Force
+        }
+        if (Test-Path "dispatch_trace.jsonl") {
+            $newTraceName = "trace_${mode}.jsonl"
+            Write-Host ">>> Renaming dispatch_trace.jsonl -> $newTraceName"
+            Move-Item "dispatch_trace.jsonl" $newTraceName -Force
+        }
+
+        Start-Sleep -Seconds 3
+    }
+}
+
+# --------------------------------------------
+# 7. [Mode] Baseline Comparisons
+# --------------------------------------------
+if ($RunBaseline) {
+    $BaselineModes = @(
+        "round_robin",
+        "greedy",
+        "static",
+        "bsp",
+        "asp",
+        "ssp"
+    )
+
+    Write-Host "`n>>> Starting [Baseline] Loop..." -ForegroundColor Green
+
+    foreach ($mode in $BaselineModes) {
+        Write-Host "--------------------------------------------------------"
+        Write-Host ">>> [Baseline] RUNNING MODE: $mode"
+        Write-Host "--------------------------------------------------------"
+
+        $env:EXPERIMENT_TYPE = "baseline"
+        $env:BASELINE_MODE = $mode
+
+        Remove-Item Env:\ABLATION_MODE -ErrorAction SilentlyContinue
+
+        if ($mode -eq "ssp") {
+            $env:SSP_LIMIT = "4"
+        }
+
+        python controller.py
+
+        if (Test-Path "metrics.csv") {
+            $newMetricName = "metrics_baseline_${mode}.csv"
+            Write-Host ">>> Renaming metrics.csv -> $newMetricName"
+            Move-Item "metrics.csv" $newMetricName -Force
+        }
+        if (Test-Path "dispatch_trace.jsonl") {
+            $newTraceName = "trace_baseline_${mode}.jsonl"
+            Write-Host ">>> Renaming dispatch_trace.jsonl -> $newTraceName"
+            Move-Item "dispatch_trace.jsonl" $newTraceName -Force
+        }
+
+        Start-Sleep -Seconds 3
+    }
+}
+
+Write-Host ""
+Write-Host "Done."

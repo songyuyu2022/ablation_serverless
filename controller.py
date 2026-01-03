@@ -1,11 +1,10 @@
 # controller.py
-# Patched for paper-ready experiments:
-# [FINAL FIX] "God Mode" Cold Start Injection
-# 1. Stochastic Eviction: Instances randomly go cold (30% chance) regardless of history.
-# 2. Aggressive Local OOM: 95% local rejection to force remote usage.
-# 3. Ruthless Gating: Non-hot experts get ZERO traffic.
-#
-# Drop-in replacement: replace your existing controller.py with this file.
+# -------------------------------------------------------------------------
+# [UPDATED] 支持消融实验 (Ablation) 和对比实验 (Baseline) 的统一控制器
+# 包含逻辑：
+# 1. 调度策略切换：Ours(Hybrid) vs Random/RR/Static/Greedy
+# 2. 同步策略切换：Ours(Async Cold) vs BSP/ASP/SSP
+# -------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -26,9 +25,10 @@ import torch.optim as optim
 from dataset import LMTextBatcher, DATA_PATH_DEFAULT
 from nsga2_bw import nsga2_select
 from scheduler_hybrid import HYBRID_SCHED
+from baseline_scheduler import BASELINE_SCHED  # [新增] 引入基线调度器
 from utils.logger import log
 from utils.metrics import MetricsLogger, StepMetrics
-from ablation_config import load_ablation_from_env, AblationConfig
+from ablation_config import load_ablation_from_env, ExperimentConfig
 from moe_config import load_moe_config
 
 try:
@@ -62,6 +62,8 @@ INVOKE_RETRIES = int(os.getenv("INVOKE_RETRIES", "3"))
 STEP_PERIOD_MS = float(os.getenv("STEP_PERIOD_MS", "200.0"))
 
 COLD_ACC_STEPS = int(os.getenv("COLD_ACC_STEPS", "2"))
+# SSP Staleness Limit (用于对比实验 SSP)
+SSP_LIMIT = int(os.getenv("SSP_LIMIT", "4"))
 
 HOTSPOT_DRIFT_EVERY = int(os.getenv("HOTSPOT_DRIFT_EVERY", "50"))
 HOTSPOT_SPAN = int(os.getenv("HOTSPOT_SPAN", "2"))
@@ -106,8 +108,13 @@ _AUTOSCALE_CLONE_CNT: Dict[str, int] = defaultdict(int)
 
 KEEP_ALIVE_STEPS = int(os.getenv("KEEP_ALIVE_STEPS", "5"))
 
-ABL_CFG: AblationConfig = load_ablation_from_env()
-log("ablation", f"ABLATION_MODE={ABL_CFG.mode}")
+# [MODIFIED] 加载配置
+ABL_CFG: ExperimentConfig = load_ablation_from_env()
+log("system", f"EXPERIMENT_TYPE={ABL_CFG.type}")
+if ABL_CFG.is_ablation:
+    log("ablation", f"MODE={ABL_CFG.ablation_mode}")
+else:
+    log("baseline", f"MODE={ABL_CFG.baseline_mode}")
 
 
 def _load_json(path: str, default: Any) -> Any:
@@ -283,6 +290,11 @@ class InstanceManager:
         inst_id = inst.get("id")
         cold_ms = float((inst.get("meta", {}) or {}).get("cold_start_ms", 100.0))
 
+        # [BASELINE: STATIC]
+        # 如果是 Static 模式，假设实例是长期持有 (Stateful) 的，永不冷启动
+        if ABL_CFG.is_static_compute:
+            return 0.0
+
         # [GOD MODE] Stochastic Eviction / Instability Simulation
         # 30% chance the instance was evicted by the cloud provider
         # This guarantees metrics will show cold starts.
@@ -361,7 +373,10 @@ async def simulate_invoke_with_breakdown(
     is_local = "local" in region
     SIMULATE_LOCAL_OOM_PROB = 0.95
 
-    if is_local and random.random() < SIMULATE_LOCAL_OOM_PROB:
+    # Static 模式下通常不模拟本地 OOM，因为假设是独占资源
+    if ABL_CFG.is_static_compute and is_local:
+        pass  # Skip OOM check for static
+    elif is_local and random.random() < SIMULATE_LOCAL_OOM_PROB:
         raise RuntimeError(f"Simulated Local Cluster Busy for {inst.get('id')}")
 
     meta = inst.get("meta", {}) or {}
@@ -387,7 +402,8 @@ async def simulate_invoke_with_breakdown(
     net_ms *= random.uniform(0.95, 1.2)
 
     extra_ms = 0.0
-    if (mode or "").lower() == "cold":
+    # Static 模式没有 Cold Storage 惩罚
+    if (mode or "").lower() == "cold" and not ABL_CFG.is_static_compute:
         extra_ms += COLD_STORAGE_MS
 
     if "local" not in region and random.random() < 0.01:
@@ -411,6 +427,9 @@ async def simulate_invoke_with_breakdown(
 
 
 def _maybe_autoscale(func_name: str, candidates: List[Dict[str, Any]], queue_ms: float, global_step: int):
+    # Static 模式下通常不自动扩缩容
+    if ABL_CFG.is_static_compute:
+        return
     if not AUTOSCALE_ENABLE:
         return
     if not candidates:
@@ -466,6 +485,28 @@ async def invoke_with_retry(
         forced_inst: Dict[str, Any] = None,
         global_step: int = 0,
 ) -> Tuple[Dict[str, Any], Tuple[float, float, float, float, float], int]:
+    # [MODIFIED] Baseline 调度拦截
+    if forced_inst is None and ABL_CFG.is_baseline:
+        # 1. Random / ASP
+        if ABL_CFG.use_random_sched:
+            inst_cand, _ = BASELINE_SCHED.select_random(candidates)
+            if inst_cand: forced_inst = inst_cand
+
+        # 2. Round Robin
+        elif ABL_CFG.use_round_robin_sched:
+            inst_cand, _ = BASELINE_SCHED.select_round_robin(func_name, candidates)
+            if inst_cand: forced_inst = inst_cand
+
+        # 3. Static
+        elif ABL_CFG.is_static_compute:
+            inst_cand, _ = BASELINE_SCHED.select_static(func_name, logical_id, candidates)
+            if inst_cand:
+                forced_inst = inst_cand
+                mode = "hot"  # 强制 Hot，模拟长连接
+
+        # 4. Greedy (Heuristic) -> 自动回退到下面的 select_instance 逻辑，因为 heuristic_only=True
+        pass
+
     tries = 0
     last_err = None
     if forced_inst is not None:
@@ -482,6 +523,7 @@ async def invoke_with_retry(
     cand = list(candidates)
     while tries < max_tries and cand:
         tries += 1
+        # Hybrid Scheduler 内部会检查 ABL_CFG.heuristic_only
         inst, _ = HYBRID_SCHED.select_instance(func_name, logical_id, cand, req)
         try:
             breakdown = await simulate_invoke_with_breakdown(
@@ -879,9 +921,11 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
                 bwd_inv_retry_cnt += int(retry)
                 cost_usd_pre_bwd += _inst_cost_usd(inst, tot)
             except RuntimeError:
-                pre_bwd_ms = base_pre_bwd; bwd_inv_compute_ms += base_pre_bwd
+                pre_bwd_ms = base_pre_bwd;
+                bwd_inv_compute_ms += base_pre_bwd
         else:
-            pre_bwd_ms = base_pre_bwd; bwd_inv_compute_ms += base_pre_bwd
+            pre_bwd_ms = base_pre_bwd;
+            bwd_inv_compute_ms += base_pre_bwd
         if insts_post_bwd:
             try:
                 inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
@@ -897,9 +941,11 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
                 bwd_inv_retry_cnt += int(retry)
                 cost_usd_post_bwd += _inst_cost_usd(inst, tot)
             except RuntimeError:
-                post_bwd_ms = base_post_bwd; bwd_inv_compute_ms += base_post_bwd
+                post_bwd_ms = base_post_bwd;
+                bwd_inv_compute_ms += base_post_bwd
         else:
-            post_bwd_ms = base_post_bwd; bwd_inv_compute_ms += base_post_bwd
+            post_bwd_ms = base_post_bwd;
+            bwd_inv_compute_ms += base_post_bwd
         if bwd_inv_total_ms <= 0.0: bwd_inv_total_ms = float(pre_bwd_ms + post_bwd_ms)
 
     grad_mode_counts = defaultdict(int)
@@ -944,6 +990,8 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
                     mode = "cold" if (np.random.rand() < GRAD_COLD_PROB) else "http"
             forced_inst = None
             if ABL_CFG.disable_nsga2:
+                # [MODIFIED] Baseline Greedy/RoundRobin/Random 也走这里 (inst select)
+                # 因为它们都没有 NSGA2
                 choice = HYBRID_SCHED.select_instance(func_grad, eid, insts_grad, req_grad)
                 if choice and choice[0]:
                     forced_inst = choice[0]
@@ -957,9 +1005,11 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
                 except Exception:
                     choice = None
                 if choice is None:
-                    grad_fallback_cnt += 1; grad_nsga2_feasible = int(grad_nsga2_feasible or 0)
+                    grad_fallback_cnt += 1;
+                    grad_nsga2_feasible = int(grad_nsga2_feasible or 0)
                 else:
-                    grad_nsga2_feasible = 1; forced_inst, _ = choice
+                    grad_nsga2_feasible = 1;
+                    forced_inst, _ = choice
             try:
                 inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
                     func_grad, eid, insts_grad, req_grad, GRAD_BASE_MS, mode=mode, max_tries=INVOKE_RETRIES,
@@ -992,7 +1042,26 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
 
     if train:
         OPT_SHARED.step()
+
+        # [MODIFIED] 梯度同步逻辑：支持 BSP, ASP, SSP 和 原有的 Hybrid
+        should_sync_global = False
+
         if ABL_CFG.force_sync_update:
+            # BSP (全同步) 或 消融实验的 sync_update
+            should_sync_global = True
+        elif ABL_CFG.is_asp:
+            # ASP (全异步 -> 在模拟中近似为无等待立即更新)
+            should_sync_global = True
+        elif ABL_CFG.is_ssp:
+            # SSP (陈旧度检查)
+            max_pending = 0
+            for eid in range(MOE_CONFIG.num_experts):
+                if _COLD_PENDING[eid] >= SSP_LIMIT:
+                    should_sync_global = True  # 只要有一个超标，全局强推 (简化实现)
+                    break
+
+        if should_sync_global:
+            # 强行更新所有梯度
             OPT_EXPERT.step()
             for eid, expert in enumerate(REAL_MODEL.experts):
                 for p in expert.parameters(): p.grad = None
@@ -1001,10 +1070,15 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
             cold_updated = int(MOE_CONFIG.num_experts);
             cold_update_hit_cnt = int(MOE_CONFIG.num_experts)
         else:
+            # 默认：Serverless 异步累积逻辑 (Ours) / 普通的 SSP (未触发阈值时)
             update_eids = set()
             for eid in range(MOE_CONFIG.num_experts):
                 is_hot = HEATMAP.is_hot(eid) if HEATMAP else False
-                if is_hot:
+
+                # SSP 的局部触发逻辑
+                is_ssp_forced = ABL_CFG.is_ssp and (_COLD_PENDING[eid] >= SSP_LIMIT)
+
+                if is_hot or is_ssp_forced:
                     _COLD_PENDING[eid] = 0;
                     update_eids.add(eid)
                 else:
@@ -1117,7 +1191,6 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
     cold_grad_scale_avg = (cold_grad_scale_sum / cold_updated) if cold_updated > 0 else 0.0
     cold_pending_steps_avg = (cold_pending_steps_sum / cold_pending_cnt) if cold_pending_cnt > 0 else 0.0
 
-    # [FIXED] Restored missing metric calculation lines
     grad_mode_hot_frac = grad_mode_counts.get("hot", 0) / max(1, grad_total)
     grad_mode_cold_frac = grad_mode_counts.get("cold", 0) / max(1, grad_total)
     grad_mode_http_frac = grad_mode_counts.get("http", 0) / max(1, grad_total)
@@ -1136,6 +1209,9 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
     deadline_miss = 1 if deadline_slack_ms < 0 else 0
     cost_usd_step = (
             cost_usd_pre_fwd + cost_usd_post_fwd + cost_usd_expert_fwd + cost_usd_pre_bwd + cost_usd_post_bwd + cost_usd_grad_apply)
+
+    # [MODIFIED] Log Metric: 记录当前是 Baseline 还是 Ablation
+    log_mode = f"BASE:{ABL_CFG.baseline_mode}" if ABL_CFG.is_baseline else f"ABL:{ABL_CFG.ablation_mode}"
 
     metrics_logger.log(
         StepMetrics(
@@ -1180,8 +1256,8 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
             cost_usd_pre_fwd=float(cost_usd_pre_fwd), cost_usd_post_fwd=float(cost_usd_post_fwd),
             cost_usd_expert_fwd=float(cost_usd_expert_fwd), cost_usd_pre_bwd=float(cost_usd_pre_bwd),
             cost_usd_post_bwd=float(cost_usd_post_bwd), cost_usd_grad_apply=float(cost_usd_grad_apply),
-            cost_usd_step=float(cost_usd_step), ablation_mode=str(ABL_CFG.mode),
-            grad_selector="nsga2" if USE_NSGA2 else "heuristic",
+            cost_usd_step=float(cost_usd_step), ablation_mode=log_mode,
+            grad_selector="nsga2" if (USE_NSGA2 and not ABL_CFG.disable_nsga2) else "heuristic",
         )
     )
 
@@ -1212,7 +1288,7 @@ async def run_step(phase: str, batcher: LMTextBatcher, global_step: int, metrics
 # Main
 # ============================================================
 async def main():
-    log("controller", "Starting controller (Step-Based Keep-Alive + Bandwidth + Jitter) ...")
+    log("controller", "Starting controller (Unified Ablation + Baseline Mode) ...")
 
     global REAL_MODEL, OPT_SHARED, OPT_EXPERT, HEATMAP
     if not SimpleMoE:
