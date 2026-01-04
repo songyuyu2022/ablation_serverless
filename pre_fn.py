@@ -1,91 +1,87 @@
 # pre_fn.py
-import os
+from __future__ import annotations
+import os, uuid
+from typing import Dict, Any
+
 import torch
-import torch.nn as nn
-from fastapi import FastAPI, Request, Response
+import torch.nn.functional as F
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-from shared import dumps, loads, tensor_to_pack, pack_to_tensor
-from moe_config import load_moe_config
-from utils.logger import log
+from shared import pack, unpack
+from dataset import build_char_vocab
+from moe_model import build_pre
 
-# --- 核心修改：引入 moe_model ---
-from moe_model import PreStage
+DEVICE = os.getenv("DEVICE", "cpu")
+DATA_PATH = os.getenv("DATA_PATH", "input.txt")
+VOCAB_PATH = os.getenv("VOCAB_PATH", "vocab.json")
+
+D_MODEL = int(os.getenv("EMB_DIM", "256"))
+NUM_EXPERTS = int(os.getenv("NUM_EXPERTS", "4"))
+TOP_K = int(os.getenv("TOP_K", "2"))
+LR_SHARED = float(os.getenv("LR_SHARED", "3e-4"))
+WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.0"))
+
+# build vocab_size from vocab.json/input
+stoi, _ = build_char_vocab(DATA_PATH, VOCAB_PATH)
+CFG = {"vocab_size": len(stoi), "d_model": D_MODEL, "num_experts": NUM_EXPERTS, "top_k": TOP_K}
+
+pre = build_pre(CFG).to(DEVICE).train()
+opt = torch.optim.AdamW(pre.parameters(), lr=LR_SHARED, weight_decay=WEIGHT_DECAY)
+
+CACHE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI()
 
-DEVICE = os.getenv("DEVICE", "cpu")
-# 如果有 GPU 可用且没被禁用
-if torch.cuda.is_available() and os.getenv("CUDA_VISIBLE_DEVICES", "") != "":
-    DEVICE = "cuda"
-
-
-def init_pre_model():
-    moe_cfg = load_moe_config()
-    log("pre-fn", f"Initializing PreStage (Real MoE). Vocab={moe_cfg.vocab_size}, Dim={moe_cfg.d_model}")
-
-    # 直接初始化 PreStage
-    model = PreStage(
-        vocab_size=moe_cfg.vocab_size,
-        d_model=moe_cfg.d_model,
-        num_experts=moe_cfg.num_experts
-    ).to(DEVICE)
-
-    # 简单优化器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    return model, optimizer
-
-
-pre_model, optimizer = init_pre_model()
-
+class Req(BaseModel):
+    trace_id: str | None = None
+    payload: dict
 
 @app.post("/fwd")
-async def pre_forward(req: Request):
-    """
-    输入: {"x": tensor[B, T]}
-    输出: {"hidden": tensor[B, T, D], "gate": tensor[B, T, E]}
-    """
-    try:
-        body = await req.body()
-        obj = loads(body)
+def fwd(req: Req):
+    trace = req.trace_id or str(uuid.uuid4())
+    obj = unpack(req.payload, map_location=DEVICE)
+    x = obj["x"]  # [B,T] long
+    x = x.to(DEVICE)
 
-        x_pack = obj.get("x")
-        if x_pack is None:
-            return Response(content="Missing 'x'", status_code=400)
+    x.requires_grad_(False)
+    h, gate_logits = pre(x)
+    probs = F.softmax(gate_logits, dim=-1)
+    topk_vals, topk_idx = torch.topk(probs, k=TOP_K, dim=-1)  # [B,T,K]
 
-        x = pack_to_tensor(x_pack).to(DEVICE).long()
-
-        # --- 真实前向计算 ---
-        h, router_logits = pre_model(x)
-
-        # 将结果返回给 Controller (或者下一级)
-        # Controller 那边会自己做 Softmax/TopK，这里返回 logits 即可
-        # 或者为了保持一致性，也可以返回 softmax 后的 probs，这里直接返回 logits 更灵活
-
-        resp_data = {
-            "hidden": tensor_to_pack(h.cpu()),
-            "gate": tensor_to_pack(router_logits.cpu())  # 注意：这里是 logits
-        }
-        return Response(content=dumps(resp_data), media_type="application/msgpack")
-
-    except Exception as e:
-        log("pre-fn", f"FWD Error: {e}")
-        return Response(content=f"Internal Error: {e}", status_code=500)
-
+    # keep graph for backward
+    CACHE[trace] = {
+        "h": h,
+        "topk_vals": topk_vals,
+        "topk_idx": topk_idx,
+    }
+    return {"trace_id": trace, "payload": pack({"h": h, "topk_vals": topk_vals, "topk_idx": topk_idx})}
 
 @app.post("/bwd")
-async def pre_backward(req: Request):
-    try:
-        body = await req.body()
-        obj = loads(body)
+def bwd(req: Req):
+    trace = req.trace_id
+    assert trace in CACHE, f"unknown trace_id={trace}"
+    obj = unpack(req.payload, map_location=DEVICE)
+    grad_h = obj["grad_h"].to(DEVICE)                 # [B,T,D]
+    grad_topk_vals = obj["grad_topk_vals"].to(DEVICE) # [B,T,K]
 
-        # 接收梯度（在真实训练中，这里会接收 dL/dh 并进行 backward）
-        # 目前版本仅做占位或简单打印
-        # if "grads" in obj:
-        #    grads = pack_to_tensor(obj["grads"]).to(DEVICE)
-        #    ... backward logic ...
+    h = CACHE[trace]["h"]
+    topk_vals = CACHE[trace]["topk_vals"]
 
-        return Response(content=dumps({"ok": True}), media_type="application/msgpack")
+    # backprop to pre params (embed+gate)
+    torch.autograd.backward([h, topk_vals], [grad_h, grad_topk_vals])
+    return {"ok": True}
 
-    except Exception as e:
-        log("pre-fn", f"BWD Error: {e}")
-        return Response(content=f"Internal Error: {e}", status_code=500)
+@app.post("/step")
+def step(req: Req):
+    opt.step()
+    return {"ok": True}
+
+@app.post("/zero")
+def zero(req: Req):
+    opt.zero_grad(set_to_none=True)
+    return {"ok": True}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "device": DEVICE, "vocab_size": len(stoi)}
