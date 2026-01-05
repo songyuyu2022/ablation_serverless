@@ -91,12 +91,15 @@ $env:AUTOSCALE_ENABLE="1"
 $env:AUTOSCALE_QUEUE_TH_MS="30"
 $env:AUTOSCALE_MAX_REPLICA="6"
 $env:AUTOSCALE_COOLDOWN_STEPS="8"
-$env:MAX_STEPS="10"
+$env:MAX_STEPS="200"
 $env:DEADLINE_WARMUP_STEPS="30"
 $env:DEADLINE_PCTL="95"
 $env:DEADLINE_SAFETY="1.10"
 $env:DEADLINE_MIN_MS="200"
 $env:INVOKE_RETRIES="20"
+$env:HOT_COVERAGE="0.70"
+$env:HOTSET_MIN="1"
+$env:HOTSET_MAX="4"   # 你的 NUM_EXPERTS
 
 # --------------------------------------------
 # Menu
