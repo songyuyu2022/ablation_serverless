@@ -91,7 +91,7 @@ $env:AUTOSCALE_ENABLE="1"
 $env:AUTOSCALE_QUEUE_TH_MS="30"
 $env:AUTOSCALE_MAX_REPLICA="6"
 $env:AUTOSCALE_COOLDOWN_STEPS="8"
-$env:MAX_STEPS="200"
+$env:MAX_STEPS="1000"
 $env:DEADLINE_WARMUP_STEPS="30"
 $env:DEADLINE_PCTL="95"
 $env:DEADLINE_SAFETY="1.10"
@@ -142,7 +142,8 @@ function Run-Controller {
 switch ($choice) {
     "1" { Run-Controller -etype "ablation" -mode "full" }
     "2" {
-        $modes = @("full","no_hotcold","sync_update","static_compute")
+        $modes = @("no_nsga", "no_online", "no_heuristic")
+        # "full","no_hotcold","sync_update","static_compute",
         foreach ($m in $modes) { Run-Controller -etype "ablation" -mode $m }
     }
     "3" {

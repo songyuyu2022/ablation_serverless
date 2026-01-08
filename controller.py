@@ -1,14 +1,10 @@
 # -------------------------------------------------------------------------
-# [UPDATED] 在原 controller 基础上：
-# 1) 保留你现有的 Ablation/Baseline + 调度 + 冷启动/网络/队列仿真 breakdown
-# 2) 把“计算”改成真正的本地 serverless：HTTP 调用 pre_fn / expert_app / post_fn 多实例执行
-# 3) 继续支持 Top-K 只调用被选择专家
-# 4) 支持“热专家立即反传/更新，冷专家梯度累计，批量 step”（异步反传）
-#
-# [FIX] 关键修复：
-# - 彻底改用 shared.py 的 tensor pack 协议（dumps/loads/tensor_to_pack/pack_to_tensor）
-# - 请求体不再包一层 {"payload": ...}，避免服务端取值不一致
-# - 自动兼容响应里带/不带 payload 两种格式
+# [UPDATED - FULL REPLACE controller.py]
+# 基于你当前 controller.py（已读入）做的增强：
+# 1) 保留你现有的 Ablation/Baseline + 冷启动/网络/队列仿真 breakdown + HTTP 执行闭环
+# 2) 新增 TriScheduler：Heuristic + OnlinePred + NSGA(Pareto) 三段调度链路
+# 3) 新增消融：no_nsga / no_online / no_heuristic
+# 4) invoke_with_retry 统一改为 TRI_SCHED.select(...)，保证 pre/post/expert 全链路消融生效
 # -------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -26,7 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-# ✅ 使用你项目既有的序列化协议（这一步是修复的核心）
+# ✅ 使用你项目既有的序列化协议
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor
 
 # ============================================================
@@ -118,6 +114,8 @@ PATH_HEALTH = os.getenv("PATH_HEALTH", "/health")
 COLD_ACC_STEPS = int(os.getenv("COLD_ACC_STEPS", "4"))
 FORCE_SYNC_UPDATE = os.getenv("FORCE_SYNC_UPDATE", "0") == "1"
 
+# Optional device (for local tensor ops in controller side)
+DEVICE = os.getenv("DEVICE", "cpu")
 
 # ============================================================
 # Ablation config
@@ -136,6 +134,11 @@ class AblationConfig:
     use_ssp: bool = False
     use_asp: bool = False
 
+    # ===== NEW: scheduler-chain ablations =====
+    disable_nsga: bool = False          # 去 NSGA/Pareto 多目标筛选
+    disable_online_pred: bool = False   # 去在线预测（EMA / online stats）
+    disable_heuristic: bool = False     # 去启发式估计（cold/net/compute/cost 的静态估计）
+
     @staticmethod
     def from_env() -> "AblationConfig":
         cfg = AblationConfig()
@@ -151,6 +154,8 @@ class AblationConfig:
             cfg.use_asp = (m == "asp")
         else:
             m = ABLATION_MODE.lower()
+
+            # ---- existing ablations ----
             if m == "no_hotcold":
                 cfg.disable_hotcold = True
             elif m == "sync_update":
@@ -163,6 +168,15 @@ class AblationConfig:
                 cfg.use_rr_sched = True
             elif m == "greedy_sched":
                 cfg.use_greedy_sched = True
+
+            # ---- NEW ablations ----
+            elif m == "no_nsga":
+                cfg.disable_nsga = True
+            elif m == "no_online":
+                cfg.disable_online_pred = True
+            elif m == "no_heuristic":
+                cfg.disable_heuristic = True
+
         return cfg
 
 
@@ -415,98 +429,6 @@ import requests
 _HTTP_SEM = asyncio.Semaphore(max(1, HTTP_CONCURRENCY))
 
 
-def _pack_payload_with_shared(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """把 Tensor 转成 shared.tensor_to_pack，其他类型原样。"""
-    out: Dict[str, Any] = {}
-    for k, v in payload.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = tensor_to_pack(v)
-        else:
-            out[k] = v
-    return out
-
-
-def _maybe_unpack_tensorpack(v: Any) -> Any:
-    """如果 v 看起来像 tensor pack，则 pack_to_tensor；否则原样返回。"""
-    if isinstance(v, dict):
-        # shared.py 的 tensor pack 一般会包含 shape/dtype/data 或 bytes 等字段
-        # 这里做“软判断”，失败就原样返回
-        try:
-            return pack_to_tensor(v)
-        except Exception:
-            return v
-    return v
-
-
-def _unpack_payload_with_shared(payload: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in payload.items():
-        out[k] = _maybe_unpack_tensorpack(v)
-    return out
-
-
-async def _http_post_raw(url: str, path: str, body_bytes: bytes) -> bytes:
-    full = url.rstrip("/") + path
-    async with _HTTP_SEM:
-        if aiohttp is not None:
-            timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(full, data=body_bytes) as resp:
-                    txt = await resp.text()
-                    if resp.status >= 400:
-                        raise RuntimeError(f"HTTP {resp.status} {full}: {txt[:400]}")
-                    return txt.encode("utf-8")
-        else:
-            def _do():
-                r = requests.post(full, data=body_bytes, timeout=HTTP_TIMEOUT_S)
-                r.raise_for_status()
-                return r.content
-            return await asyncio.to_thread(_do)
-
-
-def _to_jsonable(v: Any) -> Any:
-    """
-    把 torch.Tensor / numpy / 复杂结构递归转成 JSON 可序列化对象。
-    对于 MoE 训练里最关键的 token 输入张量，转换成 list[int] / list[list[int]] 能被 FastAPI 直接解析。
-    """
-    # torch.Tensor
-    try:
-        import torch
-        if isinstance(v, torch.Tensor):
-            # 统一放到 CPU，避免 .tolist() 报错
-            if v.device.type != "cpu":
-                v = v.detach().cpu()
-            # 标量
-            if v.dim() == 0:
-                return v.item()
-            return v.tolist()
-    except Exception:
-        pass
-
-    # numpy
-    try:
-        import numpy as np
-        if isinstance(v, np.ndarray):
-            return v.tolist()
-        if isinstance(v, (np.integer, np.floating)):
-            return v.item()
-    except Exception:
-        pass
-
-    # dict / list / tuple
-    if isinstance(v, dict):
-        return {str(k): _to_jsonable(val) for k, val in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_to_jsonable(x) for x in v]
-
-    # bytes
-    if isinstance(v, (bytes, bytearray)):
-        return v.decode("utf-8", errors="ignore")
-
-    # 其它：尽量原样返回（json 会兜底报错）
-    return v
-
-
 async def invoke_http(
     inst: Dict[str, Any],
     *,
@@ -514,8 +436,6 @@ async def invoke_http(
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    ✅ 与 expert_app/pre_fn/post_fn 统一的 HTTP 协议：
-
     Request JSON:
       {"trace_id": "...", "payload": <packed-dict>}
 
@@ -525,24 +445,19 @@ async def invoke_http(
     url = _inst_url(inst).rstrip("/")
     full = url + path
 
-    # trace_id：优先沿用 payload 里带的，否则生成一个
     trace_id = None
     if isinstance(payload, dict):
         trace_id = payload.get("trace_id") or payload.get("trace") or payload.get("_trace_id")
     if not trace_id:
         trace_id = f"tr_{int(time.time()*1000)}_{random.randint(0, 10**9)}"
 
-    # --- pack helpers (controller 侧不依赖 FastAPI schema，全部走 shared pack 协议) ---
     def _pack_any(x: Any) -> Any:
-        # torch.Tensor -> tensor_to_pack
         if isinstance(x, torch.Tensor):
             return tensor_to_pack(x.detach().cpu())
-        # numpy -> list/scalar
         if isinstance(x, np.ndarray):
             return x.tolist()
         if isinstance(x, (np.integer, np.floating)):
             return x.item()
-        # dict/list/tuple recurse
         if isinstance(x, dict):
             return {str(k): _pack_any(v) for k, v in x.items()}
         if isinstance(x, (list, tuple)):
@@ -550,9 +465,7 @@ async def invoke_http(
         return x
 
     def _unpack_any(x: Any) -> Any:
-        # packed tensor dict -> pack_to_tensor
         if isinstance(x, dict):
-            # heuristic: packed tensor has keys like "dtype","shape","data" or "t","shape","data"
             if ("shape" in x) and (("dtype" in x) or ("t" in x)) and ("data" in x):
                 try:
                     return pack_to_tensor(x).to("cpu")
@@ -564,7 +477,7 @@ async def invoke_http(
         return x
 
     pure_payload = dict(payload) if isinstance(payload, dict) else {"_raw": payload}
-    pure_payload["trace_id"] = trace_id  # 内层也写一份，兼容某些服务端从 payload 取 trace
+    pure_payload["trace_id"] = trace_id
     body_obj = {"trace_id": trace_id, "payload": _pack_any(pure_payload)}
 
     async with _HTTP_SEM:
@@ -588,7 +501,6 @@ async def invoke_http(
             if not isinstance(obj, dict):
                 return {"ok": True, "trace_id": trace_id, "_raw": obj}
 
-            # normalize response
             if "payload" in obj and isinstance(obj["payload"], dict):
                 inner = _unpack_any(obj["payload"])
                 if not isinstance(inner, dict):
@@ -597,11 +509,11 @@ async def invoke_http(
                 inner.setdefault("ok", obj.get("ok", True))
                 return inner
 
-            # old/flat response
             obj.setdefault("trace_id", obj.get("trace_id", trace_id))
             return _unpack_any(obj)
 
         return await asyncio.to_thread(_do)
+
 
 # ============================================================
 # Baseline schedulers
@@ -637,7 +549,7 @@ BASELINE_SCHED = BaselineScheduler()
 
 
 # ============================================================
-# Our hybrid scheduler (lightweight stats)
+# Our hybrid scheduler (online stats / EMA)
 # ============================================================
 
 class HybridScheduler:
@@ -672,16 +584,189 @@ HYBRID_SCHED = HybridScheduler()
 
 
 # ============================================================
+# Deadline estimator
+# ============================================================
+
+class DeadlineEstimator:
+    def __init__(self):
+        self.hist: List[float] = []
+
+    def update(self, step_ms: float):
+        self.hist.append(float(step_ms))
+        if len(self.hist) > 200:
+            self.hist.pop(0)
+
+    def deadline_ms(self, step: int) -> float:
+        if step < DEADLINE_WARMUP_STEPS or len(self.hist) < 10:
+            return float(DEADLINE_MIN_MS)
+        p = np.percentile(self.hist, DEADLINE_PCTL)
+        return float(max(DEADLINE_MIN_MS, p * DEADLINE_SAFETY))
+
+DEADLINE_EST = DeadlineEstimator()
+
+
+# ============================================================
+# Cost model
+# ============================================================
+
+def _cost_usd(inst: Dict[str, Any], dur_ms: float) -> float:
+    meta = inst.get("meta", {}) or {}
+    cents_s = float(meta.get("price_cents_s", 0.0))
+    return (cents_s / 100.0) * (dur_ms / 1000.0)
+
+
+# ============================================================
+# TriScheduler = Heuristic + OnlinePred + (NSGA-like Pareto)
+# ============================================================
+
+SCHED_W_LAT = float(os.getenv("SCHED_W_LAT", "1.0"))
+SCHED_W_COST = float(os.getenv("SCHED_W_COST", "0.15"))
+SCHED_W_COLD = float(os.getenv("SCHED_W_COLD", "0.25"))
+SCHED_W_QUEUE = float(os.getenv("SCHED_W_QUEUE", "0.05"))
+NSGA_SEED = int(os.getenv("NSGA_SEED", "42"))
+
+def _predict_static_total_ms_and_cost(
+    inst: Dict[str, Any],
+    *,
+    func_name: str,
+    mode: str,
+    base_compute_ms: float,
+) -> Tuple[float, float, float, float, float]:
+    """
+    启发式静态估计：返回 (tot_ms, cost_usd, queue_ms, cold_ms, net_ms)
+    compute_ms 也折进 tot_ms 里
+    """
+    meta = inst.get("meta", {}) or {}
+    perf = float(meta.get("performance", DEFAULT_PERFORMANCE))
+    compute_ms = float(base_compute_ms) / max(perf, 1e-6)
+
+    net_base = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY)))
+    net_ms = net_base * _mode_net_multiplier(mode)
+    if (mode or "").lower() == "cold":
+        net_ms += float(COLD_STORAGE_MS)
+
+    cold_ms = INSTANCE_MGR._default_cold_start_ms(func_name, inst) if not ABL_CFG.is_static_compute else 0.0
+    queue_ms = 0.0
+
+    tot_ms = float(queue_ms + cold_ms + net_ms + compute_ms)
+    cost = _cost_usd(inst, tot_ms)
+    return tot_ms, cost, queue_ms, cold_ms, net_ms
+
+
+class TriScheduler:
+    """
+    三段链路：
+      - heuristic: 静态估计 lat/cost/cold
+      - online_pred: HYBRID_SCHED.ema_lat 替换 lat（可消融 no_online）
+      - nsga: Pareto front 多目标筛选（可消融 no_nsga）
+    """
+    def __init__(self):
+        self.rng = random.Random(NSGA_SEED)
+
+    def _online_lat(self, inst: Dict[str, Any]) -> Optional[float]:
+        if ABL_CFG.disable_online_pred:
+            return None
+        return HYBRID_SCHED.ema_lat.get(inst.get("id"))
+
+    def _heuristic(self, inst: Dict[str, Any], *, func_name: str, mode: str, base_compute_ms: float) -> Tuple[float, float, float, float]:
+        # (lat_ms, cost_usd, cold_ms, queue_ms)
+        if ABL_CFG.disable_heuristic:
+            return 1e9, 0.0, 0.0, 0.0
+        tot_ms, cost, queue_ms, cold_ms, _net = _predict_static_total_ms_and_cost(
+            inst, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms
+        )
+        return float(tot_ms), float(cost), float(cold_ms), float(queue_ms)
+
+    @staticmethod
+    def _dominates(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+        # minimize (lat, cost)
+        return (a[0] <= b[0] and a[1] <= b[1]) and (a[0] < b[0] or a[1] < b[1])
+
+    def _pareto_front(self, pts: List[Tuple[float, float]]) -> List[int]:
+        front = []
+        for i, p in enumerate(pts):
+            dominated = False
+            for j, q in enumerate(pts):
+                if j == i:
+                    continue
+                if self._dominates(q, p):
+                    dominated = True
+                    break
+            if not dominated:
+                front.append(i)
+        return front
+
+    def _score(self, lat_ms: float, cost_usd: float, cold_ms: float, queue_ms: float) -> float:
+        return (
+            SCHED_W_LAT * float(lat_ms)
+            + SCHED_W_COST * float(cost_usd) * 1000.0
+            + SCHED_W_COLD * float(cold_ms)
+            + SCHED_W_QUEUE * float(queue_ms)
+        )
+
+    def select(
+        self,
+        inst_list: List[Dict[str, Any]],
+        *,
+        func_name: str,
+        mode: str,
+        base_compute_ms: float,
+        deadline_ms: float,
+    ) -> Dict[str, Any]:
+        if not inst_list:
+            raise RuntimeError("empty inst_list")
+
+        feats: List[Tuple[float, float, float, float]] = []
+        for inst in inst_list:
+            h_lat, h_cost, h_cold, h_queue = self._heuristic(inst, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms)
+            o_lat = self._online_lat(inst)
+            lat = float(o_lat) if (o_lat is not None) else float(h_lat)
+
+            # 双禁用：online+heuristic 都关 → 用 rtt 做一个退化估计
+            if (o_lat is None) and ABL_CFG.disable_heuristic:
+                meta = inst.get("meta", {}) or {}
+                lat = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY))) * 10.0
+
+            feats.append((lat, h_cost, h_cold, h_queue))
+
+        ok = [i for i, (lat, _c, _cold, _q) in enumerate(feats) if lat <= float(deadline_ms)]
+        cand_idx = ok if ok else list(range(len(inst_list)))
+
+        # no_nsga：直接按 score 选最小
+        if ABL_CFG.disable_nsga or len(cand_idx) <= 1:
+            best_i = None
+            best_s = 1e18
+            for i in cand_idx:
+                lat, cost, cold, q = feats[i]
+                s = self._score(lat, cost, cold, q)
+                if s < best_s:
+                    best_s = s
+                    best_i = i
+            return inst_list[int(best_i)]
+
+        pts = [(feats[i][0], feats[i][1]) for i in cand_idx]  # (lat, cost)
+        front_local = self._pareto_front(pts)
+        front = [cand_idx[j] for j in front_local]
+
+        best_i = None
+        best_s = 1e18
+        for i in front:
+            lat, cost, cold, q = feats[i]
+            s = self._score(lat, cost, cold, q)
+            if s < best_s:
+                best_s = s
+                best_i = i
+        return inst_list[int(best_i)]
+
+
+TRI_SCHED = TriScheduler()
+
+
+# ============================================================
 # Invocation wrapper with retry + baseline interception
 # ============================================================
 
 def _maybe_autoscale(func_name: str, candidates: list, queue_ms: float, global_step: int) -> None:
-    """Best-effort local autoscale hook.
-
-    该项目可选实现 autoscale（例如队列变长时增加本地 function windows）。
-    但在多数本地实验中我们默认关闭 autoscale，controller 不应因 autoscale 缺失而崩溃。
-    所以这里默认是 no-op（空实现）。
-    """
     return
 
 
@@ -733,7 +818,19 @@ async def invoke_with_retry(
     cand = list(candidates)
     while tries < max_tries and cand:
         tries += 1
-        inst = HYBRID_SCHED.select_best(cand) if not ABL_CFG.is_baseline else random.choice(cand)
+
+        if not ABL_CFG.is_baseline:
+            deadline_ms = float(DEADLINE_EST.deadline_ms(global_step))
+            inst = TRI_SCHED.select(
+                cand,
+                func_name=func_name,
+                mode=mode,
+                base_compute_ms=base_compute_ms,
+                deadline_ms=deadline_ms,
+            )
+        else:
+            inst = random.choice(cand)
+
         try:
             return await _try(inst, max(0, tries - 1))
         except Exception as e:
@@ -849,38 +946,6 @@ def append_metrics(path: str, row: Dict[str, Any]):
 
 
 # ============================================================
-# Deadline estimator
-# ============================================================
-
-class DeadlineEstimator:
-    def __init__(self):
-        self.hist: List[float] = []
-
-    def update(self, step_ms: float):
-        self.hist.append(float(step_ms))
-        if len(self.hist) > 200:
-            self.hist.pop(0)
-
-    def deadline_ms(self, step: int) -> float:
-        if step < DEADLINE_WARMUP_STEPS or len(self.hist) < 10:
-            return float(DEADLINE_MIN_MS)
-        p = np.percentile(self.hist, DEADLINE_PCTL)
-        return float(max(DEADLINE_MIN_MS, p * DEADLINE_SAFETY))
-
-DEADLINE_EST = DeadlineEstimator()
-
-
-# ============================================================
-# Cost model
-# ============================================================
-
-def _cost_usd(inst: Dict[str, Any], dur_ms: float) -> float:
-    meta = inst.get("meta", {}) or {}
-    cents_s = float(meta.get("price_cents_s", 0.0))
-    return (cents_s / 100.0) * (dur_ms / 1000.0)
-
-
-# ============================================================
 # Real dataset (char LM)
 # ============================================================
 
@@ -962,11 +1027,30 @@ POLICY = ExpertUpdatePolicy(NUM_EXPERTS, COLD_ACC_STEPS)
 
 
 # ============================================================
-# One micro-batch step
+# One micro-batch step helpers
 # ============================================================
 
 def _get_candidates(func_name: str) -> List[Dict[str, Any]]:
     return [INST_BY_ID[i] for i in FUNC_MAP.get(func_name, []) if i in INST_BY_ID]
+
+def _payload(obj: Any) -> dict:
+    if isinstance(obj, dict) and "payload" in obj and isinstance(obj["payload"], dict):
+        return obj["payload"]
+    return obj if isinstance(obj, dict) else {}
+
+def _to_tensor(v: Any, *, device: torch.device, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    if isinstance(v, torch.Tensor):
+        t = v
+    elif isinstance(v, dict):
+        try:
+            t = pack_to_tensor(v)
+        except Exception:
+            t = torch.as_tensor(v)
+    else:
+        t = torch.as_tensor(v)
+    if dtype is not None:
+        t = t.to(dtype=dtype)
+    return t.to(device)
 
 async def _invoke_fn(
     func_name: str,
@@ -998,51 +1082,23 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
     """
     单个 micro-batch 的完整闭环：
       pre/fwd -> expert/fwd -> post/fwd -> post/bwd -> expert/bwd -> pre/bwd
-    关键修复：
-      - bwd/step 必须回到对应 fwd 命中的同一个 inst（否则 trace cache miss）
-      - 取 Tensor 字段不要用 `or`（会触发 Tensor bool）
-      - 所有 HTTP 请求统一使用 {"trace_id","payload"} 协议（兼容 expert_app/pre/post）
     """
-    # =========================
-    # helpers: payload unwrap + tensor decode (must be defined before use)
-    # =========================
-    def _payload(obj: dict) -> dict:
-        """FastAPI replies may be wrapped as {'payload': {...}}. Keep outer trace_id/ok/error but read fields from payload."""
-        if isinstance(obj, dict) and "payload" in obj and isinstance(obj["payload"], dict):
-            return obj["payload"]
-        return obj if isinstance(obj, dict) else {}
-
-    def _to_tensor(v, *, device, dtype=None):
-        if isinstance(v, torch.Tensor):
-            t = v
-        elif isinstance(v, dict):
-            # packed tensor
-            try:
-                t = pack_to_tensor(v)
-            except Exception:
-                t = torch.as_tensor(v)
-        else:
-            t = torch.as_tensor(v)
-
-        if dtype is not None:
-            t = t.to(dtype=dtype)
-        return t.to(device)
-
     metrics = {
         "pre_lat": 0.0, "post_lat": 0.0, "exp_lat": 0.0,
         "inv_total_ms": 0.0, "inv_queue_ms": 0.0, "inv_cold_ms": 0.0, "inv_net_ms": 0.0, "inv_compute_ms": 0.0,
         "inv_retry_cnt": 0.0,
         "cost_usd_pre_fwd": 0.0, "cost_usd_post_fwd": 0.0, "cost_usd_expert_fwd": 0.0,
-        "fwd_mode_hot": 0, "fwd_mode_cold": 0, "fwd_mode_http": 0,
-        "grad_mode_hot": 0, "grad_mode_cold": 0, "grad_mode_http": 0,
+        "fwd_mode_hot": 0.0, "fwd_mode_cold": 0.0, "fwd_mode_http": 0.0,
+        "grad_mode_hot": 0.0, "grad_mode_cold": 0.0, "grad_mode_http": 0.0,
         "loss": float("nan"),
         "acc1": float("nan"),
         "acc5": float("nan"),
         "hot_ratio": 0.0,
         "hot_set_changed": 0.0,
         "hot_set_jaccard": 1.0,
-
     }
+
+    dev = torch.device(DEVICE)
 
     # -------------------------
     # (1) pre fwd
@@ -1056,7 +1112,7 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         payload={"x": x_tok},
         global_step=global_step,
     )
-    real_pre_ms = (time.perf_counter() - t0) * 1000.0
+    _ = (time.perf_counter() - t0) * 1000.0
 
     metrics["pre_lat"] += tot
     metrics["inv_total_ms"] += tot
@@ -1071,31 +1127,10 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
     if not USE_HTTP_EXEC:
         raise RuntimeError("USE_HTTP_EXEC=0 仅仿真延迟，不会做真实计算。你要真实计算请设 USE_HTTP_EXEC=1")
 
-    # ---- robust tensor decode (supports packed dict / list / tensor) ----
-    dev = torch.device(DEVICE if "DEVICE" in globals() else "cpu")
-
-    def _to_tensor(v, *, device: torch.device, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        if isinstance(v, torch.Tensor):
-            t = v
-        elif isinstance(v, dict):
-            # packed tensor from shared.tensor_to_pack(...)
-            try:
-                t = pack_to_tensor(v)
-            except Exception:
-                # maybe nested dict; last resort
-                t = torch.as_tensor(v)
-        else:
-            t = torch.as_tensor(v)
-
-        if dtype is not None:
-            t = t.to(dtype=dtype)
-        return t.to(device)
-
     pre_payload = _payload(pre_obj)
     h: torch.Tensor = _to_tensor(pre_payload["h"], device=dev)
-    topk_vals: torch.Tensor = _to_tensor(pre_obj["topk_vals"], device=dev)
-    topk_idx: torch.Tensor = _to_tensor(pre_obj["topk_idx"], device=dev, dtype=torch.long)
-    # ---------------------------------------------------------------
+    topk_vals: torch.Tensor = _to_tensor(pre_payload["topk_vals"], device=dev)
+    topk_idx: torch.Tensor = _to_tensor(pre_payload["topk_idx"], device=dev, dtype=torch.long)
 
     # 更新热度统计
     try:
@@ -1105,19 +1140,10 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         pass
 
     # ---------- Adaptive hot_set + mass-based hot_ratio + convergence metrics ----------
-    # env knobs (optional)
-    HOT_COVERAGE = float(os.environ.get("HOT_COVERAGE", "0.70"))  # 覆盖率阈值（建议 0.6~0.85）
+    HOT_COVERAGE = float(os.environ.get("HOT_COVERAGE", "0.70"))
     HOTSET_MIN = int(os.environ.get("HOTSET_MIN", "1"))
     HOTSET_MAX = int(os.environ.get("HOTSET_MAX", str(NUM_EXPERTS)))
 
-    # 维护热度统计
-    try:
-        async with HEATMAP_LOCK:
-            HEATMAP.update_from_routing(topk_idx, topk_vals)
-    except Exception:
-        pass
-
-    # 自适应选择 hot_set：最小集合使得累计概率 >= HOT_COVERAGE
     if ABL_CFG.disable_hotcold:
         hot_set = list(range(NUM_EXPERTS))
     else:
@@ -1136,7 +1162,7 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
             hot = list(map(int, order[:HOTSET_MAX]))
         hot_set = hot
 
-    # 质量占比 hot_ratio：路由到热专家的权重 mass / 总权重 mass
+    # hot_ratio：路由到热专家的权重 mass / 总权重 mass
     try:
         idx_flat = topk_idx.reshape(-1).detach().cpu().numpy()
         val_flat = topk_vals.reshape(-1).detach().cpu().numpy().astype(np.float32)
@@ -1150,7 +1176,6 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
     except Exception:
         metrics["hot_ratio"] = 0.0
 
-    # 收敛/稳定性指标：hot_set_changed, hot_set_jaccard
     global PREV_HOT_SET
     cur = set(hot_set)
     if PREV_HOT_SET is None:
@@ -1164,40 +1189,11 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         metrics["hot_set_jaccard"] = float(inter / union)
     PREV_HOT_SET = list(hot_set)
 
-    # -------------------------------------------------------------------------------
-
-    def _payload(obj: Any) -> dict:
-        """
-        Unwrap FastAPI responses.
-
-        Valid inputs:
-        1) {"payload": {...}}
-        2) {"payload": packed_tensor}
-        3) {"trace_id": ..., "payload": {...}}
-        4) {"h": packed_tensor, ...}
-
-        Always return a dict of fields.
-        """
-        if not isinstance(obj, dict):
-            return {}
-
-        # Case 1/2: wrapped response
-        if "payload" in obj:
-            p = obj.get("payload")
-            if isinstance(p, dict):
-                return p
-            else:
-                # payload exists but is not dict → cannot index fields
-                return {}
-
-        # Case 3: already flat dict
-        return obj
-
     # -------------------------
     # (2) experts fwd (Top-K)
     # -------------------------
     B, T, D = h.shape
-    combined = torch.zeros((B, T, D), dtype=h.dtype)
+    combined = torch.zeros((B, T, D), dtype=h.dtype, device=h.device)
     route_cache: Dict[int, Dict[str, Any]] = {}
 
     idx_np = topk_idx.detach().cpu().numpy()
@@ -1213,7 +1209,6 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
             continue
 
         b_idx, t_idx, k_idx = np.where(mask)
-
         inp = h[b_idx, t_idx, :]                         # [N,D]
         w = topk_vals[b_idx, t_idx, k_idx].unsqueeze(-1) # [N,1]
 
@@ -1229,21 +1224,11 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
             global_step=global_step,
         )
 
-        # ✅ expert 输出可能是 packed dict，需要解包成 Tensor
         exp_payload = _payload(exp_obj)
-        out_raw = exp_payload["out"]
-        if isinstance(out_raw, torch.Tensor):
-            out = out_raw
-        elif isinstance(out_raw, dict):
-            out = pack_to_tensor(out_raw)
-        else:
-            out = torch.as_tensor(out_raw)
-
-        out = out.to(h.device)
+        out = _to_tensor(exp_payload["out"], device=dev).to(h.device)
 
         combined[b_idx, t_idx, :] += out * w
 
-        # ✅ 关键：粘住实例 + trace_id（用于 bwd/step）
         route_cache[e] = {
             "inst": inst_exp,
             "trace_id": exp_obj.get("trace_id"),
@@ -1262,30 +1247,25 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         metrics["inv_retry_cnt"] += retry_cnt
         metrics["cost_usd_expert_fwd"] += _cost_usd(inst_exp, tot)
 
-        # ✅ 用 token 分配量统计，而不是“调用次数”
-        n_assign = float(len(b_idx))  # 该 expert 实际接收的 token 数
-        # ✅ 用 token 分配量统计（与 fwd 一致）
         n_assign = float(len(b_idx))
         if mode == "hot":
-            metrics["grad_mode_hot"] += n_assign
+            metrics["fwd_mode_hot"] += n_assign
         elif mode == "cold":
-            metrics["grad_mode_cold"] += n_assign
+            metrics["fwd_mode_cold"] += n_assign
         else:
-            metrics["grad_mode_http"] += n_assign
+            metrics["fwd_mode_http"] += n_assign
 
     # -------------------------
     # (3) post fwd
     # -------------------------
-    t1 = time.perf_counter()
     inst_post, post_obj, (tot, q, cold, net, comp), retry_cnt = await _invoke_fn(
         "moe.post_fwd",
         mode="http",
-        base_compute_ms=max(1.0, real_pre_ms * 0.25),
+        base_compute_ms=1.0,
         http_path=PATH_FWD,
         payload={"combined": combined, "y": y_tok},
         global_step=global_step,
     )
-    _ = (time.perf_counter() - t1) * 1000.0
 
     metrics["post_lat"] += tot
     metrics["inv_total_ms"] += tot
@@ -1301,7 +1281,6 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
     loss_raw = post_payload.get("loss", None)
     logits_raw = post_payload.get("logits", None)
 
-    # NOTE: post_fn may return packed tensors (dict) over HTTP; decode robustly.
     try:
         if loss_raw is not None:
             loss_t = _to_tensor(loss_raw, device=dev).float()
@@ -1317,48 +1296,35 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
     except Exception:
         pass
 
-# -------------------------
-    # (4) post bwd -> grad_combined  ✅ robust unpack
+    # -------------------------
+    # (4) post bwd -> grad_combined
     # -------------------------
     post_bwd_obj = await invoke_http(
         inst_post,
         path=PATH_BWD,
         payload={"trace_id": post_obj.get("trace_id")},
     )
-
     if isinstance(post_bwd_obj, dict) and (post_bwd_obj.get("ok") is False):
-        raise RuntimeError(
-            f"post_fn /bwd ok=False, error={post_bwd_obj.get('error')}, trace_id={post_bwd_obj.get('trace_id')}"
-        )
+        raise RuntimeError(f"post_fn /bwd ok=False, error={post_bwd_obj.get('error')}")
 
-    # 选出返回的梯度字段（注意：不要用 or）
-    grad_raw = None
     post_bwd_payload = _payload(post_bwd_obj)
+    grad_raw = None
     for k in ("grad_combined", "grad_h", "grad"):
         if k in post_bwd_payload and post_bwd_payload[k] is not None:
             grad_raw = post_bwd_payload[k]
             break
-
     if grad_raw is None:
-        raise KeyError(f"post_fn /bwd missing grad. keys={list(post_bwd_obj.keys())}")
+        raise KeyError(f"post_fn /bwd missing grad. keys={list(post_bwd_payload.keys())}")
 
-    # ✅ 解包：Tensor / packed dict / list
-    if isinstance(grad_raw, torch.Tensor):
-        grad_combined = grad_raw
-    elif isinstance(grad_raw, dict):
-        grad_combined = pack_to_tensor(grad_raw)
-    else:
-        grad_combined = torch.as_tensor(grad_raw)
-
-    grad_combined = grad_combined.to(h.device)
+    grad_combined = _to_tensor(grad_raw, device=dev).to(h.device)
 
     # -------------------------
-    # (5) expert bwd  ✅必须粘住 route_cache[e]['inst']
+    # (5) expert bwd (stick to route_cache inst)
     # -------------------------
     grad_h = torch.zeros_like(h)
     grad_topk_vals = torch.zeros_like(topk_vals)
 
-    update_eids, cold_upd, pending_mean = POLICY.decide(hot_set)
+    update_eids, _cold_upd, _pending_mean = POLICY.decide(hot_set)
 
     for e in selected:
         if e not in route_cache:
@@ -1372,18 +1338,18 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         w = topk_vals[b_idx, t_idx, k_idx].unsqueeze(-1)
         grad_out = grad_combined[b_idx, t_idx, :] * w
 
-        # topk_vals 的梯度（MoE gating）
         grad_w = (grad_combined[b_idx, t_idx, :] * out_vecs).sum(dim=-1)
         for i, (bi, ti, ki) in enumerate(zip(b_idx, t_idx, k_idx)):
             grad_topk_vals[bi, ti, ki] += grad_w[i]
 
         mode = "http" if ABL_CFG.disable_hotcold else ("hot" if e in hot_set else "cold")
+        n_assign = float(len(b_idx))
         if mode == "hot":
-            metrics["grad_mode_hot"] += 1
+            metrics["grad_mode_hot"] += n_assign
         elif mode == "cold":
-            metrics["grad_mode_cold"] += 1
+            metrics["grad_mode_cold"] += n_assign
         else:
-            metrics["grad_mode_http"] += 1
+            metrics["grad_mode_http"] += n_assign
 
         inst_e = route_cache[e]["inst"]
         trace_id = route_cache[e]["trace_id"]
@@ -1394,24 +1360,14 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
             payload={"trace_id": trace_id, "grad_out": grad_out},
         )
         if isinstance(exp_bwd_obj, dict) and (exp_bwd_obj.get("ok") is False):
-            raise RuntimeError(
-                f"expert {e} /bwd ok=False, error={exp_bwd_obj.get('error')}, trace_id={exp_bwd_obj.get('trace_id')}"
-            )
+            raise RuntimeError(f"expert {e} /bwd ok=False, error={exp_bwd_obj.get('error')}")
 
-        grad_inp_raw = exp_bwd_obj["grad_inp"]
-        if isinstance(grad_inp_raw, torch.Tensor):
-            grad_inp = grad_inp_raw
-        elif isinstance(grad_inp_raw, dict):
-            grad_inp = pack_to_tensor(grad_inp_raw)
-        else:
-            grad_inp = torch.as_tensor(grad_inp_raw)
-        grad_inp = grad_inp.to(h.device)
-
+        grad_inp = _to_tensor(exp_bwd_obj.get("grad_inp"), device=dev).to(h.device)
         for i, (bi, ti) in enumerate(zip(b_idx, t_idx)):
             grad_h[bi, ti, :] += grad_inp[i]
 
     # -------------------------
-    # (6) pre bwd  ✅必须粘住 inst_pre
+    # (6) pre bwd (stick to inst_pre)
     # -------------------------
     pre_bwd_obj = await invoke_http(
         inst_pre,
@@ -1426,7 +1382,7 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         raise RuntimeError(f"pre_fn /bwd ok=False: {pre_bwd_obj}")
 
     # -------------------------
-    # (7) expert step（冷专家累计更新 + 热专家每步更新）✅必须粘住 inst_e
+    # (7) expert step (hot immediate; cold accumulated)
     # -------------------------
     for e in selected:
         if e not in route_cache:
@@ -1441,8 +1397,12 @@ async def run_microbatch(global_step: int, mb_idx: int, x_tok: torch.Tensor, y_t
         if isinstance(step_obj, dict) and (step_obj.get("ok") is False):
             raise RuntimeError(f"expert {e} /step ok=False: {step_obj}")
 
-    # 返回 microbatch 指标（train() 会做窗口平均）
     return metrics
+
+
+# ============================================================
+# Train Loop
+# ============================================================
 
 async def train():
     if not os.path.exists(METRICS_FILE):
@@ -1550,6 +1510,8 @@ async def train():
                 f"fwd(h/c/http)=({row['fwd_mode_hot_frac']:.2f}/{row['fwd_mode_cold_frac']:.2f}/{row['fwd_mode_http_frac']:.2f}) "
                 f"grad(h/c/http)=({row['grad_mode_hot_frac']:.2f}/{row['grad_mode_cold_frac']:.2f}/{row['grad_mode_http_frac']:.2f})"
             )
+
+
 def main():
     asyncio.run(train())
 
