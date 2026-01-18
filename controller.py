@@ -343,6 +343,138 @@ class InstanceManager:
 
 INSTANCE_MGR = InstanceManager()
 
+# ============================================================
+# Trace-calibrated simulation (Azure 2021 + Alibaba GPU 2025)
+# ============================================================
+USE_TRACE_CALIB = os.getenv("USE_TRACE_CALIB", "1") == "1"
+
+AZURE_PROFILE_PATH = os.getenv("AZURE_PROFILE_PATH", os.path.join("tools", "calib", "azure2021_profile.json"))
+ALIBABA_GPU_PROFILE_PATH = os.getenv("ALIBABA_GPU_PROFILE_PATH", os.path.join("tools", "calib", "alibaba2025_gpu_profile.json"))
+
+# Azure trace has no explicit cold-start latency label -> we model "extra cold delay" with a tunable distribution
+COLD_P50_MS = float(os.getenv("COLD_P50_MS", "200"))
+COLD_P90_MS = float(os.getenv("COLD_P90_MS", "600"))
+COLD_P99_MS = float(os.getenv("COLD_P99_MS", "3000"))
+COLD_MAX_MS = float(os.getenv("COLD_MAX_MS", "15000"))
+
+GPU_POOL_SIZE_ENV = os.getenv("GPU_POOL_SIZE", "").strip()
+
+def _z(p: float) -> float:
+    if abs(p - 0.90) < 1e-6: return 1.281551565545
+    if abs(p - 0.95) < 1e-6: return 1.644853626951
+    if abs(p - 0.99) < 1e-6: return 2.326347874041
+    if abs(p - 0.50) < 1e-6: return 0.0
+    return 0.0
+
+def _sample_lognormal_from_q(q50: float, q90: float, rng: random.Random) -> float:
+    import math
+    q50 = max(float(q50), 1e-12)
+    q90 = max(float(q90), q50 * 1.000001)
+    mu = math.log(q50)
+    sigma = (math.log(q90) - mu) / max(_z(0.90), 1e-9)
+    return float(math.exp(rng.gauss(mu, sigma)))
+
+class TraceCalibrator:
+    def __init__(self):
+        self.ok = False
+        self.azure = None
+        self.gpu = None
+        self.rng = random.Random(int(os.getenv("TRACE_SEED", "123")))
+
+        self.azure_pairs, self.azure_w = [], []
+        self.gpu_pairs, self.gpu_w = [], []
+        self.gpu_cap_p95 = None
+
+        try:
+            if USE_TRACE_CALIB and os.path.exists(AZURE_PROFILE_PATH):
+                with open(AZURE_PROFILE_PATH, "r", encoding="utf-8") as f:
+                    self.azure = json.load(f)
+                pairs = self.azure.get("pairs", {}) or {}
+                for k, v in pairs.items():
+                    c = int(v.get("count", 0) or 0)
+                    if c > 0:
+                        self.azure_pairs.append(k)
+                        self.azure_w.append(c)
+
+            if USE_TRACE_CALIB and os.path.exists(ALIBABA_GPU_PROFILE_PATH):
+                with open(ALIBABA_GPU_PROFILE_PATH, "r", encoding="utf-8") as f:
+                    self.gpu = json.load(f)
+                pairs = self.gpu.get("pairs", {}) or {}
+                for k, v in pairs.items():
+                    c = int(v.get("count", 0) or 0)
+                    if c > 0:
+                        self.gpu_pairs.append(k)
+                        self.gpu_w.append(c)
+                cap = (self.gpu.get("capacity_recommendation", {}) or {})
+                self.gpu_cap_p95 = cap.get("cap_p95", None)
+
+            self.ok = (self.azure is not None) or (self.gpu is not None)
+        except Exception as e:
+            print(f"[TraceCalib] load failed: {e}")
+            self.ok = False
+
+    def _weighted_choice(self, keys, weights):
+        if not keys:
+            return None
+        return self.rng.choices(keys, weights=weights, k=1)[0]
+
+    # ---- Azure ----
+    def sample_azure_pair(self):
+        return self._weighted_choice(self.azure_pairs, self.azure_w)
+
+    def inferred_cold_prob(self, pair_key):
+        if not self.azure:
+            return 0.0
+        pairs = self.azure.get("pairs", {}) or {}
+        if pair_key and pair_key in pairs:
+            p = pairs[pair_key].get("inferred_cold_prob", None)
+            if p is not None:
+                return float(p)
+        g = (self.azure.get("global", {}) or {})
+        p = g.get("inferred_cold_prob", None)
+        return float(p) if p is not None else 0.0
+
+    def sample_cold_extra_ms(self) -> float:
+        x = _sample_lognormal_from_q(COLD_P50_MS, COLD_P90_MS, self.rng)
+        x = min(x, COLD_MAX_MS)
+        if self.rng.random() < 0.01:
+            x = min(max(x, COLD_P99_MS), COLD_MAX_MS)
+        return float(x)
+
+    # ---- Alibaba GPU ----
+    def sample_gpu_pair(self):
+        return self._weighted_choice(self.gpu_pairs, self.gpu_w)
+
+    def sample_gpu_duration_ms(self, pair_key):
+        if not self.gpu:
+            return None
+        pairs = self.gpu.get("pairs", {}) or {}
+        rec = pairs.get(pair_key, None) if (pair_key and pair_key in pairs) else None
+        dur = (rec.get("duration_s") if rec else (self.gpu.get("global", {}) or {}).get("duration_s", None))
+        if not dur:
+            return None
+        q50 = dur.get("log_quantiles", {}).get("q50", None) or dur.get("p50", None)
+        q90 = dur.get("log_quantiles", {}).get("q90", None) or dur.get("p90", None)
+        if q50 is None or q90 is None:
+            return None
+        sec = _sample_lognormal_from_q(float(q50), float(q90), self.rng)
+        return float(sec * 1000.0)
+
+TRACE = TraceCalibrator()
+
+# GPU pool semaphore (global GPU capacity contention)
+GPU_POOL_SEM = None
+if USE_TRACE_CALIB and TRACE.gpu_cap_p95 is not None:
+    try:
+        pool_n = int(GPU_POOL_SIZE_ENV) if GPU_POOL_SIZE_ENV else int(TRACE.gpu_cap_p95)
+        pool_n = max(1, pool_n)
+        GPU_POOL_SEM = asyncio.Semaphore(pool_n)
+        print(f"[TraceCalib] GPU_POOL_SEM size={pool_n}")
+    except Exception as e:
+        print(f"[TraceCalib] GPU_POOL_SEM init failed: {e}")
+        GPU_POOL_SEM = None
+
+
 INSTANCE_SEM: Dict[str, asyncio.Semaphore] = {}
 INSTANCE_MAX_CONC_DEFAULT = int(os.getenv("INSTANCE_MAX_CONC_DEFAULT", "1"))
 
@@ -399,15 +531,54 @@ async def simulate_invoke_with_breakdown(
 
     meta = inst.get("meta", {}) or {}
     perf = float(meta.get("performance", DEFAULT_PERFORMANCE))
+
+    # (A) base compute fallback
     raw_compute = float(base_compute_ms) / max(perf, 1e-6)
     compute_ms = raw_compute * random.uniform(0.90, 1.10)
 
+    # (B) cold start baseline from your InstanceManager
     cold_ms = float(await INSTANCE_MGR.cold_start_ms(inst, func_name=func_name, mode=mode))
 
+    # (C) identify GPU-like tasks (expert stages are treated as GPU by default)
+    is_gpu_task = False
+    try:
+        if float(meta.get("gpu_request", 0) or 0) > 0:
+            is_gpu_task = True
+        if float(meta.get("gpu_limit", 0) or 0) > 0:
+            is_gpu_task = True
+        dev = str(meta.get("device", "")).lower()
+        if "gpu" in dev or "cuda" in dev:
+            is_gpu_task = True
+    except Exception:
+        pass
+    if "expert" in (func_name or "").lower():
+        is_gpu_task = True
+
+    # (D) Azure-calibrated cold probability -> inject extra cold delay
+    if USE_TRACE_CALIB and TRACE.azure is not None:
+        az_pair = TRACE.sample_azure_pair()  # popularity-weighted
+        p_cold = TRACE.inferred_cold_prob(az_pair)
+        if random.random() < float(p_cold):
+            cold_ms += TRACE.sample_cold_extra_ms()
+
+    # (E) Alibaba-calibrated GPU duration -> override compute_ms
+    if USE_TRACE_CALIB and is_gpu_task and TRACE.gpu is not None:
+        gpu_pair = TRACE.sample_gpu_pair()
+        sampled = TRACE.sample_gpu_duration_ms(gpu_pair)
+        if sampled is not None:
+            compute_ms = float(sampled)
+
+    # (F) queueing: instance semaphore + optional GPU pool semaphore
     sem = _get_inst_sem(inst)
     tq0 = time.perf_counter()
     async with sem:
         queue_ms = (time.perf_counter() - tq0) * 1000.0
+
+        # GPU pool contention (global)
+        if USE_TRACE_CALIB and is_gpu_task and GPU_POOL_SEM is not None:
+            tg0 = time.perf_counter()
+            async with GPU_POOL_SEM:
+                queue_ms += (time.perf_counter() - tg0) * 1000.0
 
         net_base = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY)))
         net_ms = net_base * _mode_net_multiplier(mode) * random.uniform(0.90, 1.10)

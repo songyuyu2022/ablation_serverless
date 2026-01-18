@@ -142,8 +142,8 @@ function Run-Controller {
 switch ($choice) {
     "1" { Run-Controller -etype "ablation" -mode "full" }
     "2" {
-        $modes = @("no_nsga", "no_online", "no_heuristic")
-        # "full","no_hotcold","sync_update","static_compute",
+        $modes = @("static_compute")
+        # "full","no_hotcold","sync_update","static_compute","no_nsga", "no_online", "no_heuristic"
         foreach ($m in $modes) { Run-Controller -etype "ablation" -mode $m }
     }
     "3" {
