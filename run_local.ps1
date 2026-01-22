@@ -1,5 +1,5 @@
 # ============================================
-# run_ablation_all.ps1 - Automated Experiment Runner
+# run_local.ps1 - Headless Local Simulation
 # ============================================
 
 Write-Host ">>> Activating virtual environment..."
@@ -20,92 +20,42 @@ Write-Host ">>> Project root = $ROOT"
 $env:COMM_SIM_DIR        = "comm_sim"
 $env:INSTANCES_FILE      = "instances.json"
 $env:FUNC_MAP_FILE       = "func_map.json"
-$env:CUDA_VISIBLE_DEVICES = ""      # CPU only
+$env:CUDA_VISIBLE_DEVICES = ""      # CPU only for controller logic
 
 # --------------------------------------------
-# Helper: start new PowerShell window
+# KEY CONFIG: Enable Local Compute Mode
 # --------------------------------------------
-function Start-Window {
-    param([string]$command)
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", $command
-}
-
-# --------------------------------------------
-# Start all function windows
-# --------------------------------------------
-function Start-AllFunctions {
-
-    Write-Host "`n>>> Starting function windows..."
-
-    # pre_fn
-    Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8001"
-    Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8002"
-    Start-Window -command "`$env:TOP_K='2'; `$env:NUM_EXPERTS='4'; uvicorn pre_fn:app --host 127.0.0.1 --port 8003"
-
-    # post_fn
-    Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8101"
-    Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8102"
-    Start-Window -command "`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256'; uvicorn post_fn:app --host 127.0.0.1 --port 8103"
-
-    # experts
-    Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8201"
-    Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8202"
-    Start-Window -command "`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8203"
-
-    Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8211"
-    Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8212"
-    Start-Window -command "`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8213"
-
-    Start-Window -command "`$env:LOGICAL_EID='2'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8221"
-    Start-Window -command "`$env:LOGICAL_EID='2'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8222"
-
-    Start-Window -command "`$env:LOGICAL_EID='3'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8231"
-    Start-Window -command "`$env:LOGICAL_EID='3'; `$env:EMB_DIM='256'; uvicorn expert_app:app --host 127.0.0.1 --port 8232"
-
-    Write-Host ">>> Function windows started."
-}
+# "0" = Do NOT use external HTTP uvicorn servers
+$env:USE_HTTP_EXEC="0"
+# "1" = Enable In-Process LocalExecutor
+$env:LOCAL_COMPUTE="1"
 
 # --------------------------------------------
-# Default experiment knobs
+# Simulation Knobs
 # --------------------------------------------
 $env:HOTSPOT_DRIFT_EVERY="50"
-$env:HOTSPOT_SPAN="1"
 $env:HOT_PROB="0.85"
 $env:WARM_PROB="0.10"
-$env:KEEP_ALIVE_STEPS="5"
 
-# --- Serverless cold-start realism knobs (used by controller.py) ---
-$env:KEEP_ALIVE_MS="5000"          # warm retention window in real time (ms)
-$env:EVICTION_BASE_PROB="0.02"     # base reclaim probability
-$env:EVICTION_TAU_MS="20000"       # reclaim grows with idle (ms)
-$env:KEEPALIVE_MUL_HOT="1.5"       # hot path keeps warm longer
-$env:KEEPALIVE_MUL_COLD="0.7"      # cold path more likely to go cold
-$env:KEEPALIVE_MUL_HTTP="1.0"
-$env:LOCAL_OOM_PROB="0.05"         # local contention probability (was 0.95 in old code)
-$env:TRAFFIC_SKEW_ENABLE="1"       # 1=enable hotspot drift; 0=use natural gating only
-
-$env:GRAD_HOT_PROB="0.90"
-$env:GRAD_COLD_PROB="0.90"
-
+# Serverless realism
+$env:KEEP_ALIVE_MS="5000"
+$env:EVICTION_BASE_PROB="0.02"
+$env:EVICTION_TAU_MS="20000"
 $env:AUTOSCALE_ENABLE="1"
 $env:AUTOSCALE_QUEUE_TH_MS="30"
-$env:AUTOSCALE_MAX_REPLICA="6"
-$env:AUTOSCALE_COOLDOWN_STEPS="8"
+$env:AUTOSCALE_MAX_REPLICA="100" # Allowed to scale high locally
+$env:VM_COLD_START_MS="2000"
+
+# Experiment Settings
 $env:MAX_STEPS="1000"
-$env:DEADLINE_WARMUP_STEPS="30"
-$env:DEADLINE_PCTL="95"
-$env:DEADLINE_SAFETY="1.10"
-$env:DEADLINE_MIN_MS="200"
-$env:INVOKE_RETRIES="20"
-$env:HOT_COVERAGE="0.70"
-$env:HOTSET_MIN="1"
-$env:HOTSET_MAX="4"   # 你的 NUM_EXPERTS
+$env:LOG_TRAIN_EVERY="10"
 
 # --------------------------------------------
 # Menu
 # --------------------------------------------
 Write-Host "`n================================================"
-Write-Host "   SELECT EXPERIMENT MODE"
+Write-Host "   HEADLESS SIMULATION MODE"
+Write-Host "   (No external windows required)"
 Write-Host "================================================"
 Write-Host " [1] Run Ours (My Method)"
 Write-Host " [2] Run Ablation Variants"
@@ -115,15 +65,6 @@ Write-Host "================================================"
 
 $choice = Read-Host "Enter your choice (1-4)"
 
-# --------------------------------------------
-# Start functions
-# --------------------------------------------
-Start-AllFunctions
-Start-Sleep -Seconds 2
-
-# --------------------------------------------
-# Run controller
-# --------------------------------------------
 function Run-Controller {
     param([string]$etype, [string]$mode)
     if ($etype -eq "baseline") {
@@ -142,26 +83,18 @@ function Run-Controller {
 switch ($choice) {
     "1" { Run-Controller -etype "ablation" -mode "full" }
     "2" {
-        $modes = @("static_compute")
-        # "full","no_hotcold","sync_update","static_compute","no_nsga", "no_online", "no_heuristic"
+        $modes = @("static_compute", "no_nsga", "no_online")
         foreach ($m in $modes) { Run-Controller -etype "ablation" -mode $m }
     }
     "3" {
-        $modes = @("round_robin","greedy","bsp","ssp","asp","random","static")
-        foreach ($m in $modes) {
-            if ($m -eq "ssp") { $env:SSP_LIMIT="4" }
-            Run-Controller -etype "baseline" -mode $m
-        }
+        $modes = @("round_robin","greedy","random")
+        foreach ($m in $modes) { Run-Controller -etype "baseline" -mode $m }
     }
     "4" {
-        $ab = @("full","no_hotcold","sync_update","static_compute")
+        $ab = @("full","no_hotcold")
         foreach ($m in $ab) { Run-Controller -etype "ablation" -mode $m }
-
-        $bl = @("round_robin","greedy","bsp","ssp","asp","random","static")
-        foreach ($m in $bl) {
-            if ($m -eq "ssp") { $env:SSP_LIMIT="4" }
-            Run-Controller -etype "baseline" -mode $m
-        }
+        $bl = @("round_robin","greedy")
+        foreach ($m in $bl) { Run-Controller -etype "baseline" -mode $m }
     }
     default { Write-Host "[ERROR] Invalid selection." }
 }
