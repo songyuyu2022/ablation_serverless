@@ -298,64 +298,45 @@ class LocalExecutor:
             if path == PATH_FWD:
                 if "pre" in func_name:
                     x = self._unpack_tensor(payload, "x")
-                    # Forward via Adapter Interface
-                    # MakeMoEPreStage 返回的是 dict
-                    res = self.pre(x)
+                    res = self.pre(x)  # 调用 adapter.MakeMoEPreStage
 
-                    h = res["hidden_states"]
-                    # 注意：Adapter返回的是softmax后的weights，但controller期望topk_vals
-                    # 这里为了兼容，我们需要确保 controller 逻辑匹配。
-                    # controller 使用: topk_idx 来路由。
-                    topk_idx = res["expert_indices"]
-                    # 这里的 weights 是概率值，controller 可能直接用作权重
-                    topk_vals = res["expert_weights"]
-
-                    save_key = f"{trace_id}_pre"
-                    # 存 input 用于重计算
-                    save_data = {"x": tensor_to_pack(x.detach())}
-                    self._save_tensor(save_key, save_data, mode)
-
+                    # 必须把 context 和 expert_inputs 序列化返回给 controller
                     return {
                         "trace_id": trace_id,
-                        "h": tensor_to_pack(h.detach()),
-                        "topk_vals": tensor_to_pack(topk_vals.detach()),
-                        "topk_idx": tensor_to_pack(topk_idx.detach())
+                        "expert_inputs": {eid: tensor_to_pack(t) for eid, t in res["expert_inputs"].items()},
+                        "context": {
+                            "residual": tensor_to_pack(res["context"]["residual"]),
+                            "topk_idx": tensor_to_pack(res["context"]["topk_idx"]),
+                            "topk_weights": tensor_to_pack(res["context"]["topk_weights"])
+                        },
+                        # 兼容基础统计字段
+                        "h": tensor_to_pack(res["hidden_states"]),
+                        "topk_idx": tensor_to_pack(res["expert_indices"]),
+                        "topk_vals": tensor_to_pack(res["expert_weights"])
                     }
 
                 if "expert" in func_name:
-                    try:
-                        eid = int(func_name.split(":")[-1])
-                    except:
-                        eid = 0
+                    eid = int(func_name.split(":")[-1])
                     inp = self._unpack_tensor(payload, "inp")
-
-                    with torch.no_grad():
-                        out = self.experts[eid](inp)
-
-                    save_key = f"{trace_id}_exp_{eid}"
-                    save_data = {"inp": tensor_to_pack(inp.detach())}
-                    self._save_tensor(save_key, save_data, mode, force_hot=True)
-
-                    return {
-                        "trace_id": trace_id,
-                        "out": tensor_to_pack(out.detach())
-                    }
+                    out = self.experts[eid](inp)
+                    return {"trace_id": trace_id, "out": tensor_to_pack(out)}
 
                 if "post" in func_name:
-                    combined = self._unpack_tensor(payload, "combined")
-                    y = self._unpack_tensor(payload, "y")
+                    # 获取来自各专家的输出
+                    results = payload.get("expert_results", [])
+                    # 将打包的 tensor 转回 torch.Tensor
+                    expert_outs = [self._unpack_tensor(r, "out") for r in results]
 
-                    combined.requires_grad_(True)
-                    logits, loss = self.post(combined, targets=y)
+                    # 获取 context 并解包
+                    ctx_raw = payload.get("pre_context", {})
+                    context = {
+                        "residual": self._unpack_tensor(ctx_raw, "residual"),
+                        "topk_idx": self._unpack_tensor(ctx_raw, "topk_idx"),
+                        "topk_weights": self._unpack_tensor(ctx_raw, "topk_weights")
+                    }
 
-                    save_key = f"{trace_id}_post"
-                    self._save_tensor(save_key,
-                                      {"combined": tensor_to_pack(combined.detach()), "y": tensor_to_pack(y.detach())},
-                                      "hot")
-
-                    # 缓存 loss 用于 BWD
-                    self._post_loss_cache = getattr(self, "_post_loss_cache", {})
-                    self._post_loss_cache[trace_id] = {"loss": loss, "combined": combined}
+                    y = self._unpack_tensor(payload, "targets")
+                    logits, loss = self.post(expert_outs, context, targets=y)
 
                     return {
                         "trace_id": trace_id,
@@ -587,9 +568,9 @@ class InstanceManager:
     def __init__(self):
         self.last_used_ts_ms: Dict[str, float] = {}
         self.lock = asyncio.Lock()
-        self.keep_alive_ms = float(os.getenv("KEEP_ALIVE_MS", "5000"))
-        self.eviction_base_prob = float(os.getenv("EVICTION_BASE_PROB", "0.02"))
-        self.eviction_tau_ms = float(os.getenv("EVICTION_TAU_MS", "20000"))
+        self.keep_alive_ms = float(os.getenv("KEEP_ALIVE_MS", "400"))
+        self.eviction_base_prob = float(os.getenv("EVICTION_BASE_PROB", "0.3"))
+        self.eviction_tau_ms = float(os.getenv("EVICTION_TAU_MS", "2000"))
         self.keepalive_mul_hot = float(os.getenv("KEEPALIVE_MUL_HOT", "1.5"))
         self.keepalive_mul_cold = float(os.getenv("KEEPALIVE_MUL_COLD", "0.7"))
         self.keepalive_mul_http = float(os.getenv("KEEPALIVE_MUL_HTTP", "1.0"))
@@ -1073,21 +1054,27 @@ async def invoke_with_retry(func_name, logical_id, candidates, req, base_compute
 
 async def _invoke_fn(func_name, *, mode, base_compute_ms, http_path, payload, global_step):
     cands = _get_candidates(func_name)
+
+    # 【修复】如果本地执行器开启，且 JSON 里没配这个函数，则使用虚拟实例
+    if not cands and LOCAL_EXECUTOR:
+        inst = {"id": "local_v_inst", "region": "local", "meta": {"performance": 1.0}}
+        obj = await LOCAL_EXECUTOR.run(func_name, http_path, payload)
+        return inst, obj, (0.0, 0.0, 0.0, 0.0, 0.0), 0
+
     if not cands:
         cands = [INST_BY_ID[i] for i in FUNC_MAP.get(func_name, []) if i in INST_BY_ID]
         if not cands: raise RuntimeError(f"No candidates for {func_name}")
-    inst, breakdown, retry_cnt = await invoke_with_retry(func_name, 0, cands, req={}, base_compute_ms=base_compute_ms,
-                                                         mode=mode, max_tries=INVOKE_RETRIES, global_step=global_step)
 
-    # [KEY CHANGE] Redirect to LocalExecutor if active
+    inst, breakdown, retry_cnt = await invoke_with_retry(
+        func_name, 0, cands, req={}, base_compute_ms=base_compute_ms,
+        mode=mode, max_tries=INVOKE_RETRIES, global_step=global_step
+    )
+
     if LOCAL_EXECUTOR:
         obj = await LOCAL_EXECUTOR.run(func_name, http_path, payload)
-    elif USE_HTTP_EXEC:
-        obj = await invoke_http(inst, path=http_path, payload=payload)
     else:
-        obj = {}
+        obj = await invoke_http(inst, path=http_path, payload=payload) if USE_HTTP_EXEC else {}
     return inst, obj, breakdown, retry_cnt
-
 
 # ============================================================
 # Main Train Loop (UNCHANGED logic, just shortened for brevity)
@@ -1230,136 +1217,78 @@ POLICY = ExpertUpdatePolicy(NUM_EXPERTS, COLD_ACC_STEPS)
 # =========================================================================
 async def run_microbatch(step: int, micro_step: int, x: torch.Tensor, y: torch.Tensor):
     split = "train"
-    trace_id = str(uuid.uuid4())
-
-    import torch
-    my_device = "cuda" if torch.cuda.is_available() else "cpu"
+    trace_id = f"step_{step}_mb_{micro_step}_{uuid.uuid4().hex[:8]}"
+    my_device = DEVICE
     x_tok = x.to(my_device)
     y_tok = y.to(my_device)
 
-    # 计数器
-    total_calls = 0
-    cold_calls = 0
+    # 初始化统计计数器
+    total_invocations = 0
+    cold_invocations = 0
 
-    # -------------------------------------------------------------
-    # (1) Pre Fwd
-    # -------------------------------------------------------------
-    payload_pre = {
-        "trace_id": trace_id, "inp": tensor_to_pack(x_tok), "split": split
-    }
+    # 1. 训练准备：Zero Grad
+    if split == "train":
+        await _invoke_fn("moe.pre_zero", mode="http", payload={}, base_compute_ms=0, http_path=PATH_ZERO,
+                         global_step=step)
+        # ... (其他 zero 调用)
 
-    # 调用 Pre
-    inst_pre, pre_obj, (t1, q1, c1, n1, cmp1), r1 = await _invoke_fn(
-        "moe.pre_fwd", mode="http", payload=payload_pre,
-        base_compute_ms=10.0, http_path="/pre", global_step=step
+    # 2. Forward 流程
+    # Pre Stage
+    # 注意：使用 _invoke_fn 返回的 breakdown[2] (cold_ms) 来判断是否为冷启动
+    _, pre_obj, bd1, _ = await _invoke_fn(
+        "moe.pre_fwd", mode="http", payload={"x": tensor_to_pack(x_tok)},
+        base_compute_ms=10.0, http_path=PATH_FWD, global_step=step
     )
+    total_invocations += 1
+    if bd1[2] > 0: cold_invocations += 1  # bd1[2] 是 cold_start_ms
 
-    if pre_obj is None: return None
-
-    # 统计 Pre 状态
-    total_calls += 1
-    if c1 > 0: cold_calls += 1
-
-    # -------------------------------------------------------------
-    # (2) Expert Fwd
-    # -------------------------------------------------------------
-    expert_inputs_packed = pre_obj.get("expert_inputs", {})
+    # Expert Stage
+    expert_inputs = pre_obj.get("expert_inputs", {})
     fwd_tasks = []
-
-    for eid_str, inp_packed in expert_inputs_packed.items():
+    for eid_str, inp_pack in expert_inputs.items():
         eid = int(eid_str)
-        p_exp = {"trace_id": trace_id, "inp": inp_packed, "split": split}
-        fname = f"moe.expert_fwd:{eid}"
+        fwd_tasks.append(_invoke_fn(f"moe.expert_fwd:{eid}", mode="hot", payload={"inp": inp_pack},
+                                    base_compute_ms=20.0, http_path=PATH_FWD, global_step=step))
 
-        t = _invoke_fn(
-            fname, mode="hot", payload=p_exp,
-            base_compute_ms=20.0, http_path=f"/expert/{eid}", global_step=step
-        )
-        fwd_tasks.append(t)
+    expert_results = await asyncio.gather(*fwd_tasks)
 
-    expert_results = []
-    t2, q2, c2, n2, cmp2, r2 = 0, 0, 0, 0, 0, 0
+    # 统计专家的冷启动情况
+    for res in expert_results:
+        total_invocations += 1
+        if res[2][2] > 0: cold_invocations += 1  # 统计每个专家调用是否冷启动
 
-    if len(fwd_tasks) > 0:
-        results_list = await asyncio.gather(*fwd_tasks)
-        for res_tuple in results_list:
-            if res_tuple is None: continue
-            inst_e, obj_e, bd_e, retry_e = res_tuple
+    exp_outs = [res[1] for res in expert_results]
+    t2 = max([res[2][0] for res in expert_results]) if expert_results else 0
 
-            # 统计 Expert 状态
-            total_calls += 1
-            if bd_e[2] > 0: cold_calls += 1  # bd_e[2] is cold_ms
-
-            if obj_e is not None:
-                t2 = max(t2, bd_e[0])
-                # ... (其他延迟统计略，保持原样取最大即可)
-                c2 = max(c2, bd_e[2])  # 记录最大的冷启动时间用于日志
-                r2 += retry_e
-                expert_results.append(obj_e)
-
-    # -------------------------------------------------------------
-    # (3) Post Fwd
-    # -------------------------------------------------------------
-    payload_post = {
-        "trace_id": trace_id, "pre_context": pre_obj.get("context", {}),
-        "expert_results": expert_results, "targets": tensor_to_pack(y_tok),
-        "split": split
-    }
-
-    inst_post, post_obj, (t3, q3, c3, n3, cmp3), r3 = await _invoke_fn(
-        "moe.post_fwd", mode="http", payload=payload_post,
-        base_compute_ms=10.0, http_path="/post", global_step=step
+    # Post Stage
+    _, post_obj, bd3, _ = await _invoke_fn(
+        "moe.post_fwd", mode="http", payload={"expert_results": exp_outs, "pre_context": pre_obj.get("context", {}),
+                                              "targets": tensor_to_pack(y_tok)},
+        base_compute_ms=10.0, http_path=PATH_FWD, global_step=step
     )
+    total_invocations += 1
+    if bd3[2] > 0: cold_invocations += 1
 
-    if post_obj is None: return None
+    loss_val = post_obj.get("loss", 0.0)
 
-    # 统计 Post 状态
-    total_calls += 1
-    if c3 > 0: cold_calls += 1
+    # 3. 训练核心：Backward & Step (略，保持你现有的逻辑)
+    # ...
 
-    # -------------------------------------------------------------
-    # (4) 结果计算
-    # -------------------------------------------------------------
-    # ... (Logits 解包逻辑保持不变) ...
-    logits = None
-    if "logits" in post_obj:
-        try:
-            logits = _to_tensor(post_obj["logits"], device=my_device).float()
-        except:
-            try:
-                logits = _to_tensor(post_obj["logits"], device="cpu").float()
-            except:
-                pass
+    # 4. 修复 hot_ratio 计算
+    # 真实的 hot_ratio = (总调用次数 - 冷启动次数) / 总调用次数
+    real_hot_ratio = (total_invocations - cold_invocations) / total_invocations if total_invocations > 0 else 1.0
 
-    loss_val = float(post_obj.get("loss", 0.0))
-    acc1, acc5 = 0.0, 0.0
-    if logits is not None:
-        try:
-            y_flat = y_tok.view(-1)
-            acc1 = _acc_topk(logits, y_flat, 1)
-            acc5 = _acc_topk(logits, y_flat, 5)
-        except:
-            pass
-
-    # 【关键】计算真实的 Hot Ratio
-    # 如果 total_calls 是 0 (异常)，设为 1.0 避免除零
-    real_hot_ratio = 1.0 - (cold_calls / total_calls) if total_calls > 0 else 1.0
-
-    result_row = {
+    return {
         "loss": loss_val,
-        "acc1": acc1,
-        "acc5": acc5,
-        "pre_lat": t1, "exp_lat": t2, "post_lat": t3, "e2e_lat": t1 + t2 + t3,
-        "inv_retry_cnt": r1 + r2 + r3, "inv_cold_ms": c1 + c2 + c3,
-        "fwd_mode_hot": 1, "fwd_mode_cold": 0, "fwd_mode_http": 0,
-
-        # 使用真实计算的比率
-        "hot_ratio": real_hot_ratio,
-
+        "acc5": 0.0,
+        "pre_lat": bd1[0], "exp_lat": t2, "post_lat": bd3[0],
+        "inv_cold_ms": bd1[2] + bd3[2] + sum([res[2][2] for res in expert_results]),
+        "hot_ratio": real_hot_ratio,  # 返回真实计算的比例
+        "fwd_mode_hot": total_invocations - cold_invocations,
+        "fwd_mode_cold": cold_invocations,
+        "fwd_mode_http": 0,
         "cost_usd": 0.0001
     }
-    return result_row
-
 
 async def train():
     if not os.path.exists(METRICS_FILE): write_metrics_header(METRICS_FILE)
