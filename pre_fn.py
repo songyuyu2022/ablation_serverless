@@ -1,4 +1,4 @@
-# pre_fn.py (robust drop-in)
+# pre_fn.py (UPDATED - REAL SERVERLESS MODE)
 from __future__ import annotations
 
 import os
@@ -11,7 +11,9 @@ import torch.nn.functional as F
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from shared import pack, unpack
+# ✅ 引入通信组件
+from shared import pack, unpack, tensor_to_pack, pack_to_tensor
+from comm import CommManager
 from dataset import build_char_vocab
 from moe_model import build_pre
 
@@ -41,8 +43,9 @@ pre.train()
 
 opt = torch.optim.AdamW(pre.parameters(), lr=LR_SHARED, weight_decay=WEIGHT_DECAY)
 
-# Forward cache for backward
-CACHE: Dict[str, Dict[str, Any]] = {}
+# ✅ 初始化通信管理器，废弃 CACHE
+comm = CommManager()
+# CACHE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI()
 
@@ -51,17 +54,9 @@ app = FastAPI()
 # Helpers
 # -------------------------
 def _normalize_body(body: Any) -> Tuple[str, Dict[str, Any]]:
-    """
-    Accept multiple shapes:
-      1) {"trace_id": "...", "payload": {...}}
-      2) {"payload": {...}}
-      3) {"trace_id": "...", ...payload fields...}
-      4) {...payload fields...}
-    """
     if not isinstance(body, dict):
         trace = str(uuid.uuid4())
         return trace, {"_raw": body}
-
     trace = body.get("trace_id") or body.get("trace")
     if "payload" in body and isinstance(body["payload"], dict):
         payload = body["payload"]
@@ -69,7 +64,6 @@ def _normalize_body(body: Any) -> Tuple[str, Dict[str, Any]]:
             trace = payload.get("trace_id") or payload.get("trace")
         trace = trace or str(uuid.uuid4())
         return trace, payload
-
     payload = dict(body)
     payload.pop("trace_id", None)
     payload.pop("trace", None)
@@ -78,7 +72,6 @@ def _normalize_body(body: Any) -> Tuple[str, Dict[str, Any]]:
 
 
 def _safe_unpack(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Try shared.unpack first; if already raw, return as-is
     try:
         obj = unpack(payload, map_location=DEVICE)
         return obj if isinstance(obj, dict) else {"_unpacked": obj}
@@ -89,18 +82,11 @@ def _safe_unpack(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _to_tensor(x: Any, device: str) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x.to(device)
-    # common: list -> tensor
     t = torch.as_tensor(x)
     return t.to(device)
 
 
 def _extract_pre_outputs(out: Any) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Support multiple build_pre return conventions:
-      - (h, gate_logits)
-      - {"h":..., "gate_logits":...}
-      - {"h":..., "logits":...}
-    """
     if isinstance(out, (tuple, list)) and len(out) >= 2:
         return out[0], out[1]
     if isinstance(out, dict):
@@ -123,25 +109,23 @@ async def fwd(request: Request):
         obj = _safe_unpack(payload)
 
         if "x" not in obj:
-            return JSONResponse(
-                status_code=400,
-                content={"ok": False, "trace_id": trace, "error": "missing field 'x'", "recv_keys": list(obj.keys())},
-            )
+            return JSONResponse(status_code=400, content={"ok": False, "trace_id": trace, "error": "missing 'x'"})
 
         x = _to_tensor(obj["x"], DEVICE)
+        if x.dtype != torch.long: x = x.long()
 
-        # Ensure [B,T] long for embedding
-        if x.dtype != torch.long:
-            x = x.long()
-
-        # forward
+        # 1. Forward
         out = pre(x)
         h, gate_logits = _extract_pre_outputs(out)
 
         probs = F.softmax(gate_logits, dim=-1)
         topk_vals, topk_idx = torch.topk(probs, k=TOP_K, dim=-1)
 
-        CACHE[trace] = {"h": h, "topk_vals": topk_vals, "topk_idx": topk_idx}
+        # 2. [修改] 存入 Hot Store (Redis)
+        # Pre 阶段只需存 Input x 即可重计算
+        save_key = f"{trace}_pre"
+        save_data = {"x": tensor_to_pack(x.detach())}
+        comm.send_hot(save_key, save_data)
 
         return {
             "ok": True,
@@ -150,12 +134,8 @@ async def fwd(request: Request):
         }
 
     except Exception as e:
-        # Return traceback so you can see real root cause in controller response body
         tb = traceback.format_exc(limit=50)
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": str(e), "traceback": tb},
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e), "traceback": tb})
 
 
 @app.post("/bwd")
@@ -164,29 +144,53 @@ async def bwd(request: Request):
         body = await request.json()
         trace, payload = _normalize_body(body)
 
-        if trace not in CACHE:
-            return JSONResponse(status_code=400, content={"ok": False, "trace_id": trace, "error": "unknown trace_id"})
+        # 1. [修改] 从 Hot Store 读取
+        save_key = f"{trace}_pre"
+        saved_data = comm.pull_hot(save_key, delete=True)
 
+        if saved_data is None:
+            return JSONResponse(status_code=400, content={"ok": False, "trace_id": trace, "error": "Pre trace expired"})
+
+        # 2. 恢复 Input 并重计算
+        x_data = saved_data["x"]
+        if isinstance(x_data, dict):
+            x = pack_to_tensor(x_data, map_location=DEVICE)
+        else:
+            x = _to_tensor(x_data, DEVICE)
+
+        if x.dtype != torch.long: x = x.long()
+
+        # Re-compute Forward (构建计算图)
+        out = pre(x)
+        h, gate_logits = _extract_pre_outputs(out)
+
+        # 为了求导 gate_logits，我们需要重演 softmax 和 topk 吗？
+        # 通常 grad_h 和 grad_topk_vals 是从 controller 传回来的
+        # 如果我们只对 h 和 gate_logits 求导，直接 backward 即可
+        # 注意：controller 传回的是 grad_topk_vals，这意味着我们需要连 topk 操作也重算一遍
+        # 才能把梯度传回 gate_logits
+
+        probs = F.softmax(gate_logits, dim=-1)
+        topk_vals, topk_idx = torch.topk(probs, k=TOP_K, dim=-1)
+
+        # 3. 接收梯度
         obj = _safe_unpack(payload)
-
-        if "grad_h" not in obj or "grad_topk_vals" not in obj:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "ok": False,
-                    "trace_id": trace,
-                    "error": "missing grad_h or grad_topk_vals",
-                    "recv_keys": list(obj.keys()) if isinstance(obj, dict) else str(type(obj)),
-                },
-            )
+        if "grad_h" not in obj:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "missing grad_h"})
 
         grad_h = _to_tensor(obj["grad_h"], DEVICE)
-        grad_topk_vals = _to_tensor(obj["grad_topk_vals"], DEVICE)
 
-        h = CACHE[trace]["h"]
-        topk_vals = CACHE[trace]["topk_vals"]
+        # 简单的 backward (假设 grad_topk_vals 是可选的，或者你主要关注 embedding 梯度)
+        # 如果 controller 实现了对 gate 的梯度回传：
+        tensors_to_grad = [h]
+        grads = [grad_h]
 
-        torch.autograd.backward([h, topk_vals], [grad_h, grad_topk_vals])
+        if "grad_topk_vals" in obj:
+            grad_topk = _to_tensor(obj["grad_topk_vals"], DEVICE)
+            tensors_to_grad.append(topk_vals)
+            grads.append(grad_topk)
+
+        torch.autograd.backward(tensors_to_grad, grads)
 
         return {"ok": True, "trace_id": trace}
 
@@ -197,7 +201,6 @@ async def bwd(request: Request):
 
 @app.post("/step")
 async def step(request: Request):
-    # ignore body
     opt.step()
     return {"ok": True}
 
@@ -210,4 +213,4 @@ async def zero(request: Request):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "device": DEVICE, "vocab_size": len(stoi), "top_k": TOP_K, "num_experts": NUM_EXPERTS}
+    return {"ok": True, "device": DEVICE}

@@ -1,177 +1,152 @@
+# generate_instances.py (Pro Version - 基于 Azure Trace 统计规律)
 import json
-import os
 import random
-import copy
-import numpy as np
+import numpy as np  # 需要 numpy 来生成高级分布
 
-# ================= 配置区域 =================
+# ==========================================
+# 配置区域
+# ==========================================
+NUM_EXPERTS = 8
+NUM_PRE_INSTANCES = 8
+NUM_POST_INSTANCES = 8
+NUM_EXPERT_REPLICAS = 4
 
-# 关键改动1：稀缺性控制
-# 我们不让每种类型都生成一样多，而是让高端卡更少
-REPLICAS_MAP = {
-    "A100": 4,  # 只有 4 个 A100 (稀缺，容易排队)
-    "V100": 8,  # 8 个 V100
-    "T4": 20,  # 20 个 T4 (充裕，不用排队)
-    "CPU": 32  # 32 个 CPU
-}
+# ==========================================
+# 统计规律参数 (基于 Azure Functions Trace 2019)
+# ==========================================
+# 1. 冷启动: Log-Normal 分布 (长尾效应)
+# 均值 mu=5.5 (约244ms), sigma=0.8 -> 范围主要在 100ms ~ 2000ms，偶见 5s+
+COLD_START_MU = 5.5
+COLD_START_SIGMA = 0.8
 
-# 关键改动2：引入 MIG 切分 (A100_MIG)
-# 模拟 "计算快但显存小" 的情况
-GPU_TIERS = [
-    # --- 顶级全卡 (完美，但极贵、极少) ---
-    {
-        "name": "NVIDIA_A100_80G",
-        "family": "A100",
-        "prob": 0.05,  # 只有 5% 的概率抽到完整卡
-        "perf_base": 5.0,
-        "mem_base": 81920,  # 80GB
-        "sys_mem": 128 * 1024,
-        "cpu_base": 24,
-        "price": 0.40,
-        "desc": "A100 Full"
-    },
-    # --- A100 MIG 切分 (陷阱：算力强，显存小) ---
-    {
-        "name": "NVIDIA_A100_MIG_1g.5gb",
-        "family": "A100",
-        "prob": 0.15,  # 15% 概率是这种切片
-        "perf_base": 4.5,  # 算力依然是 A100 级别的强 (架构优势)
-        "mem_base": 5120,  # 【坑】只有 5GB 显存！容易 OOM
-        "sys_mem": 16 * 1024,
-        "cpu_base": 2,  # 配套 CPU 也很弱
-        "price": 0.08,  # 便宜
-        "desc": "A100 MIG Slice (High Perf, Low Mem)"
-    },
-    # --- 主流卡 (V100) ---
-    {
-        "name": "NVIDIA_V100_32G",
-        "family": "V100",
-        "prob": 0.30,
-        "perf_base": 2.5,
-        "mem_base": 32768,
-        "sys_mem": 64 * 1024,
-        "cpu_base": 8,
-        "price": 0.18,
-        "desc": "V100 Mainstream"
-    },
-    # --- 低端卡 (T4) ---
-    {
-        "name": "NVIDIA_T4_16G",
-        "family": "T4",
-        "prob": 0.50,  # 50% 都是这种低端卡
-        "perf_base": 1.0,
-        "mem_base": 16384,
-        "sys_mem": 32 * 1024,
-        "cpu_base": 4,
-        "price": 0.06,
-        "desc": "T4 Entry"
-    }
-]
+# 2. 性能波动: Normal 分布 (多租户干扰)
+# 均值 1.0 (基准), 标准差 0.1 (10% 波动)
+PERF_MU = 1.0
+PERF_SIGMA = 0.1
 
-CPU_TIERS = [
-    {"name": "Intel_Platinum", "family": "CPU", "prob": 0.2, "perf_base": 1.2, "sys_mem": 32 * 1024, "cpu_base": 8,
-     "price": 0.002, "desc": "Fast CPU"},
-    {"name": "Intel_Xeon", "family": "CPU", "prob": 0.8, "perf_base": 0.6, "sys_mem": 16 * 1024, "cpu_base": 4,
-     "price": 0.001, "desc": "Slow CPU"},
-]
-
-PERF_JITTER = 0.10
-
-# ================= 基础模板 =================
-# 这里的 "type" 决定了它去哪个池子抽奖
-RAW_TEMPLATES = [
-    {"base_id": "fn_pre_gpu", "func_name": "moe.pre_fwd", "type": "gpu", "start_port": 10000,
-     "base_meta": {"device": "cuda", "cold_start_ms": 500.0}},
-    {"base_id": "fn_pre_cpu", "func_name": "moe.pre_fwd", "type": "cpu", "start_port": 11000,
-     "base_meta": {"device": "cpu", "cold_start_ms": 200.0}},
-    {"base_id": "fn_post_gpu", "func_name": "moe.post_fwd", "type": "gpu", "start_port": 12000,
-     "base_meta": {"device": "cuda", "cold_start_ms": 500.0}},
-    {"base_id": "fn_post_cpu", "func_name": "moe.post_fwd", "type": "cpu", "start_port": 13000,
-     "base_meta": {"device": "cpu", "cold_start_ms": 200.0}},
-]
-
-NUM_EXPERTS = 4
-for i in range(NUM_EXPERTS):
-    # Expert 既可能是 GPU 也可能是 CPU
-    RAW_TEMPLATES.append(
-        {"base_id": f"fn_exp{i}_gpu", "func_name": f"moe.expert_fwd:{i}", "type": "gpu", "start_port": 20000 + i * 1000,
-         "base_meta": {"device": "cuda", "cold_start_ms": 800.0, "gpu_request": 1}})
-    RAW_TEMPLATES.append(
-        {"base_id": f"fn_exp{i}_cpu", "func_name": f"moe.expert_fwd:{i}", "type": "cpu", "start_port": 30000 + i * 1000,
-         "base_meta": {"device": "cpu", "cold_start_ms": 250.0}})
+# 3. 网络延迟: Gamma 分布 (大部分很快，少数慢)
+# shape=2.0, scale=2.0 -> 均值 4ms, 长尾可达 15ms+
+NET_LATENCY_SHAPE = 2.0
+NET_LATENCY_SCALE = 2.0
 
 
-# ================= 生成逻辑 =================
-def pick_tier(tiers):
-    r = random.random()
-    cum = 0.0
-    for t in tiers:
-        cum += t["prob"]
-        if r <= cum: return t
-    return tiers[-1]
+def get_real_cold_start(is_gpu=False):
+    # 基础冷启动
+    val = np.random.lognormal(COLD_START_MU, COLD_START_SIGMA)
+    # 限制最小值和最大值，防止过于离谱
+    val = max(50.0, min(val, 15000.0))
+    if is_gpu:
+        # GPU 冷启动通常比 CPU 慢 2-3 倍 (加载 CUDA context)
+        val *= random.uniform(2.0, 3.5)
+    return round(val, 1)
 
 
-instances = []
-func_map = {}
+def get_real_perf(base=1.0):
+    # 性能因子：值越大代表性能越强 (处理越快)
+    # 引入 10% 的正态波动
+    noise = np.random.normal(0, PERF_SIGMA)
+    val = base + noise
+    return round(max(0.1, val), 2)
 
-print(f"Generating instances with MIG Slicing & Scarcity constraints...")
-random.seed(42)
 
-for t in RAW_TEMPLATES:
-    func_name = t["func_name"]
-    if func_name not in func_map: func_map[func_name] = []
+def get_real_net_latency():
+    # 网络延迟
+    val = np.random.gamma(NET_LATENCY_SHAPE, NET_LATENCY_SCALE)
+    return round(max(0.5, val), 1)
 
-    tier_pool = GPU_TIERS if t["type"] == "gpu" else CPU_TIERS
 
-    # 动态决定生成多少个副本
-    # 我们先预生成一批，然后根据稀缺性过滤
-    # 这里简化处理：直接生成一大批，然后根据概率分布，自然就会出现 A100 少 T4 多的情况
-    # 因为 GPU_TIERS 里的 prob 已经定义了 A100 只有 0.05
+def generate():
+    instances = []
+    func_map = {}
 
-    # 为了保证总数足够，我们生成 30 个，依靠概率来控制分布
-    TOTAL_GEN = 30
-
-    for r in range(1, TOTAL_GEN + 1):
-        inst_id = f"{t['base_id']}_{r}"
-        port = t['start_port'] + r
-
-        # 1. 抽取硬件档次
-        tier = pick_tier(tier_pool)
-
-        # 2. 注入 Jitter
-        jitter = random.uniform(1.0 - PERF_JITTER, 1.0 + PERF_JITTER)
-        final_perf = round(tier["perf_base"] * jitter, 3)
-
-        inst = {
-            "id": inst_id,
-            "url": f"http://127.0.0.1:{port}",
-            "runtime": "python3.11" if t["type"] == "gpu" else "python3.10",
-            "memory_mb": tier["sys_mem"],
-            "cpu_cores": tier["cpu_base"],
-            "region": f"local-{t['type']}-pool",
-            "meta": copy.deepcopy(t["base_meta"])
-        }
-
-        # 3. 填充 Meta
-        inst["meta"].update({
-            "desc": f"{tier['desc']} #{r}",
-            "tier": tier["name"],
-            "performance": final_perf,
-            "price_cents_s": tier["price"],
-            "gpu_mem_mb": tier.get("mem_base", 0)  # 显存
+    # 1. 生成 Pre 实例 (CPU)
+    pre_ids = []
+    for i in range(NUM_PRE_INSTANCES):
+        iid = f"inst_pre_{i}"
+        pre_ids.append(iid)
+        instances.append({
+            "id": iid,
+            "region": "local",
+            "cpu_cores": 2,
+            "memory_mb": 4096,
+            "meta": {
+                "performance": get_real_perf(base=1.0),
+                "net_latency_ms": get_real_net_latency(),
+                "price_cents_s": 0.002,
+                "cold_start_ms": get_real_cold_start(is_gpu=False)  # ✅ 真实分布
+            }
         })
+    func_map["moe.pre_fwd"] = pre_ids
 
-        instances.append(inst)
-        func_map[func_name].append(inst_id)
+    # 2. 生成 Post 实例 (CPU)
+    post_ids = []
+    for i in range(NUM_POST_INSTANCES):
+        iid = f"inst_post_{i}"
+        post_ids.append(iid)
+        instances.append({
+            "id": iid,
+            "region": "local",
+            "cpu_cores": 2,
+            "memory_mb": 4096,
+            "meta": {
+                "performance": get_real_perf(base=1.0),
+                "net_latency_ms": get_real_net_latency(),
+                "price_cents_s": 0.002,
+                "cold_start_ms": get_real_cold_start(is_gpu=False)  # ✅ 真实分布
+            }
+        })
+    func_map["moe.post_fwd"] = post_ids
 
-with open("instances.json", "w", encoding="utf-8") as f:
-    json.dump(instances, f, indent=2, ensure_ascii=False)
-with open("func_map.json", "w", encoding="utf-8") as f:
-    json.dump(func_map, f, indent=2, ensure_ascii=False)
+    # 3. 生成 Expert 实例 (GPU)
+    for e in range(NUM_EXPERTS):
+        exp_ids = []
+        for r in range(NUM_EXPERT_REPLICAS):
+            iid = f"inst_exp{e}_rep{r}"
+            exp_ids.append(iid)
 
-print(f"✅ Generated {len(instances)} instances.")
-print("=== Sample Distribution ===")
-tiers = [i['meta']['tier'] for i in instances if 'gpu' in i['id']]
-from collections import Counter
+            # 模拟异构性：设定不同的基准性能
+            # 副本0: 高性能 (A100类)
+            # 副本1: 中等 (T4类)
+            # 副本2: 慢速 (旧卡)
+            # 副本3: 极慢 (CPU fallback 或 拥塞卡)
+            if r == 0:
+                base_perf = 1.5
+            elif r == 1:
+                base_perf = 1.0
+            elif r == 2:
+                base_perf = 0.7
+            else:
+                base_perf = 0.4
 
-print(Counter(tiers))
+            perf = get_real_perf(base=base_perf)
+            price = 0.01 * perf
+
+            instances.append({
+                "id": iid,
+                "region": "local",
+                "cpu_cores": 4,
+                "memory_mb": 8192,
+                "meta": {
+                    "device": "gpu",
+                    "performance": perf,
+                    "net_latency_ms": get_real_net_latency(),
+                    "price_cents_s": round(price, 4),
+                    "cold_start_ms": get_real_cold_start(is_gpu=True)  # ✅ GPU启动更慢
+                }
+            })
+        func_map[f"moe.expert_fwd:{e}"] = exp_ids
+
+    # 4. 写入文件
+    with open("instances.json", "w", encoding="utf-8") as f:
+        json.dump(instances, f, indent=2)
+
+    with open("func_map.json", "w", encoding="utf-8") as f:
+        json.dump(func_map, f, indent=2)
+
+    print(f"Generated {len(instances)} instances with REALISTIC distributions.")
+    print(f"Pre/Post pool size: {NUM_PRE_INSTANCES}")
+    print(f"Expert Count: {NUM_EXPERTS} (Replicas per expert: {NUM_EXPERT_REPLICAS})")
+
+
+if __name__ == "__main__":
+    generate()
