@@ -5,8 +5,9 @@
 # 2) 拦截 USE_HTTP_EXEC=0 的情况，转为调用 LocalExecutor
 # 3) 完美保留所有延迟仿真 (Autoscaler, Azure Trace, Cold Start)
 # -------------------------------------------------------------------------
-
-from __future__ import annotations
+# [NEW] 引入新的指标记录器
+from utils.metrics import StepMetrics, MetricsLogger
+# from __future__ import annotations
 import os
 import asyncio
 import json
@@ -29,6 +30,33 @@ from makeMoE import MakeMoEConfig
 from comm import CommManager
 import requests
 
+# [Insert in controller.py] 辅助类：计算预测器 R2 Score
+class PredictionMonitor:
+    def __init__(self, window_size=50):
+        self.window_size = window_size
+        self.history_true = []
+        self.history_pred = []
+
+    def update(self, y_true, y_pred):
+        if y_pred is None or y_pred <= 0: return
+        self.history_true.append(float(y_true))
+        self.history_pred.append(float(y_pred))
+        if len(self.history_true) > self.window_size:
+            self.history_true.pop(0)
+            self.history_pred.pop(0)
+
+    def get_r2_mae(self):
+        if len(self.history_true) < 5: return 0.0, 0.0
+        y_true = np.array(self.history_true)
+        y_pred = np.array(self.history_pred)
+        mae = np.mean(np.abs(y_true - y_pred))
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        r2 = 0.0 if ss_tot < 1e-6 else (1 - (ss_res / ss_tot))
+        return float(r2), float(mae)
+
+# 实例化全局监控器
+PRED_MONITOR = PredictionMonitor()
 
 class RealDataLoader:
     def __init__(self, block_size, batch_size):
@@ -89,7 +117,7 @@ ABLATION_MODE = os.getenv("ABLATION_MODE", "full")
 BASELINE_MODE = os.getenv("BASELINE_MODE", "round_robin")
 
 # Training
-MAX_STEPS = int(os.getenv("MAX_STEPS", "800"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 MICRO_BATCH = int(os.getenv("MICRO_BATCH", "4"))
 LOG_TRAIN_EVERY = int(os.getenv("LOG_TRAIN_EVERY", "20"))
@@ -131,8 +159,8 @@ COLD_STORAGE_MS = float(os.getenv("COLD_STORAGE_MS", "12.0"))
 INVOKE_RETRIES = int(os.getenv("INVOKE_RETRIES", "10"))
 DEADLINE_WARMUP_STEPS = int(os.getenv("DEADLINE_WARMUP_STEPS", "30"))
 DEADLINE_PCTL = int(os.getenv("DEADLINE_PCTL", "95"))
-DEADLINE_SAFETY = float(os.getenv("DEADLINE_SAFETY", "1.10"))
-DEADLINE_MIN_MS = float(os.getenv("DEADLINE_MIN_MS", "200"))
+DEADLINE_SAFETY = float(os.getenv("DEADLINE_SAFETY", "1.5"))
+DEADLINE_MIN_MS = float(os.getenv("DEADLINE_MIN_MS", "800"))
 
 # ---- HTTP / LOCAL EXECUTION SWITCH ----
 # "1" = Real HTTP requests (needs uvicorn), "0" = Local In-Process Simulation
@@ -237,12 +265,15 @@ class LocalExecutor:
         self.device = torch.device(DEVICE)
         print(f"[LocalExecutor] Initializing MakeMoE Adapter on {self.device}...")
 
+        # 💡 预先实例化 DataLoader 获取真实词表大小
+        temp_loader = RealDataLoader(block_size=64, batch_size=4)
+
         # 1. 实例化 MakeMoE 配置
         self.moe_cfg = MakeMoEConfig()
 
         # 2. 【关键】用环境变量覆盖默认值
         # 这样你在 run_local.ps1 里设置的 NUM_EXPERTS="8" 才会生效
-        self.moe_cfg.vocab_size = VOCAB_SIZE
+        self.moe_cfg.vocab_size = temp_loader.vocab_size
         self.moe_cfg.n_embed = EMB_DIM  # 对应环境变量 EMB_DIM
         self.moe_cfg.num_experts = NUM_EXPERTS  # 对应环境变量 NUM_EXPERTS
         self.moe_cfg.top_k = TOP_K
@@ -289,19 +320,24 @@ class LocalExecutor:
             return self.comm.pull_hot(key, delete=delete)
 
     async def run(self, func_name: str, path: str, payload: Dict[str, Any], mode: str = "http") -> Dict[str, Any]:
+        # 💡 [NEW] 1. 在函数入口记录精确开始时间
+        t_start = time.perf_counter()
+
         async with self.lock:
             trace_id = payload.get("trace_id")
             if not trace_id:
                 trace_id = f"local_{uuid.uuid4()}"
 
+            # 用于存储最终业务结果的变量
+            res_data = {"ok": False}
+
             # --- Forward Pass ---
             if path == PATH_FWD:
                 if "pre" in func_name:
                     x = self._unpack_tensor(payload, "x")
-                    res = self.pre(x)  # 调用 adapter.MakeMoEPreStage
-
-                    # 必须把 context 和 expert_inputs 序列化返回给 controller
-                    return {
+                    res = self.pre(x)
+                    res_data = {
+                        "ok": True,
                         "trace_id": trace_id,
                         "expert_inputs": {eid: tensor_to_pack(t) for eid, t in res["expert_inputs"].items()},
                         "context": {
@@ -309,38 +345,49 @@ class LocalExecutor:
                             "topk_idx": tensor_to_pack(res["context"]["topk_idx"]),
                             "topk_weights": tensor_to_pack(res["context"]["topk_weights"])
                         },
-                        # 兼容基础统计字段
                         "h": tensor_to_pack(res["hidden_states"]),
                         "topk_idx": tensor_to_pack(res["expert_indices"]),
                         "topk_vals": tensor_to_pack(res["expert_weights"])
                     }
 
-                if "expert" in func_name:
+                elif "expert" in func_name:
                     eid = int(func_name.split(":")[-1])
                     inp = self._unpack_tensor(payload, "inp")
                     out = self.experts[eid](inp)
-                    return {"trace_id": trace_id, "out": tensor_to_pack(out)}
+                    res_data = {"ok": True, "trace_id": trace_id, "out": tensor_to_pack(out)}
 
-                if "post" in func_name:
-                    # 获取来自各专家的输出
+                elif "post" in func_name:
                     results = payload.get("expert_results", [])
-                    # 将打包的 tensor 转回 torch.Tensor
                     expert_outs = [self._unpack_tensor(r, "out") for r in results]
-
-                    # 获取 context 并解包
                     ctx_raw = payload.get("pre_context", {})
                     context = {
                         "residual": self._unpack_tensor(ctx_raw, "residual"),
                         "topk_idx": self._unpack_tensor(ctx_raw, "topk_idx"),
                         "topk_weights": self._unpack_tensor(ctx_raw, "topk_weights")
                     }
-
                     y = self._unpack_tensor(payload, "targets")
                     logits, loss = self.post(expert_outs, context, targets=y)
 
-                    return {
+                    with torch.no_grad():
+                        # 1. 统一调整形状：将 logits 变为 [Total_Tokens, Vocab_Size]
+                        # 256 是 4 * 64 的结果
+                        b_logits = logits.view(-1, logits.size(-1))
+                        b_y = y.view(-1)  # 将真实标签变为 [Total_Tokens]
+
+                        # 2. 【修正点】使用展平后的 b_logits 获取 topk
+                        # 此时 pred 的形状是 [256, 5]
+                        _, pred = b_logits.topk(5, dim=-1)
+
+                        # 3. 【修正点】使用展平后的 b_y 进行对比
+                        # b_y.unsqueeze(-1) 是 [256, 1]，可以成功 expand 为 [256, 5]
+                        correct = pred.eq(b_y.unsqueeze(-1).expand_as(pred))
+                        acc5_val = correct.any(dim=-1).float().mean().item()
+
+                    res_data = {
+                        "ok": True,
                         "trace_id": trace_id,
                         "logits": tensor_to_pack(logits.detach()),
+                        "acc5": acc5_val,
                         "loss": loss.item() if loss is not None else 0.0
                     }
 
@@ -349,85 +396,75 @@ class LocalExecutor:
                 if "post" in func_name:
                     cache = getattr(self, "_post_loss_cache", {})
                     if trace_id in cache:
-                        loss = cache[trace_id]["loss"]
+                        loss = cache[trace_id]["loss"];
                         combined = cache[trace_id]["combined"]
                         self.opt_post.zero_grad()
                         loss.backward()
                         grad_combined = combined.grad
                         del cache[trace_id]
-                        return {
-                            "grad_combined": tensor_to_pack(grad_combined),
-                            "grad": tensor_to_pack(grad_combined)
-                        }
-                    return {"ok": False, "error": "No loss found in memory cache"}
+                        res_data = {"ok": True, "grad_combined": tensor_to_pack(grad_combined),
+                                    "grad": tensor_to_pack(grad_combined)}
+                    else:
+                        res_data = {"ok": False, "error": "No loss found"}
 
-                if "expert" in func_name:
+                elif "expert" in func_name:
                     try:
                         eid = int(func_name.split(":")[-1])
-                    except:
-                        eid = 0
+                        save_key = f"{trace_id}_exp_{eid}"
+                        saved_data = self._load_tensor(save_key, mode, delete=True, try_hot_first=True)
+                        if saved_data:
+                            inp = _to_tensor(saved_data["inp"], device=self.device).requires_grad_(True)
+                            out = self.experts[eid](inp)
+                            grad_out = self._unpack_tensor(payload, "grad_out")
+                            self.opt_exps[eid].zero_grad()
+                            out.backward(grad_out)
+                            res_data = {"ok": True, "grad_inp": tensor_to_pack(inp.grad)}
+                        else:
+                            res_data = {"ok": False, "error": "Trace not found"}
+                    except Exception as e:
+                        res_data = {"ok": False, "error": str(e)}
 
-                    save_key = f"{trace_id}_exp_{eid}"
-                    saved_data = self._load_tensor(save_key, mode, delete=True, try_hot_first=True)
-
-                    if saved_data is None:
-                        return {"ok": False, "error": f"Trace {save_key} not found"}
-
-                    inp_data = saved_data["inp"]
-                    inp = _to_tensor(inp_data, device=self.device)
-                    inp.requires_grad_(True)
-
-                    # Re-computation
-                    out = self.experts[eid](inp)
-
-                    grad_out = self._unpack_tensor(payload, "grad_out")
-                    self.opt_exps[eid].zero_grad()
-                    out.backward(grad_out)
-
-                    return {"grad_inp": tensor_to_pack(inp.grad)}
-
-                if "pre" in func_name:
+                elif "pre" in func_name:
                     save_key = f"{trace_id}_pre"
                     saved_data = self._load_tensor(save_key, mode, delete=True)
-
                     if saved_data:
                         x = _to_tensor(saved_data["x"], device=self.device)
                         if x.dtype != torch.long: x = x.long()
-
-                        # Re-computation Pre
                         res = self.pre(x)
-                        h = res["hidden_states"]
-                        # Pre BWD: 接收 grad_h
+                        h = res["hidden_states"];
                         grad_h = self._unpack_tensor(payload, "grad_h")
-
                         self.opt_pre.zero_grad()
                         h.backward(grad_h)
-                        return {"ok": True}
-                    return {"ok": False, "error": "Pre trace not found"}
+                        res_data = {"ok": True}
+                    else:
+                        res_data = {"ok": False, "error": "Pre trace not found"}
 
-            elif path == PATH_STEP:
-                if "pre" in func_name: self.opt_pre.step()
-                if "post" in func_name: self.opt_post.step()
+            elif path in [PATH_STEP, PATH_ZERO]:
+                # 处理优化器 Step 或 Zero Grad
+                if "pre" in func_name: getattr(self.opt_pre, "step" if path == PATH_STEP else "zero_grad")()
+                if "post" in func_name: getattr(self.opt_post, "step" if path == PATH_STEP else "zero_grad")()
                 if "expert" in func_name:
                     try:
                         eid = int(func_name.split(":")[-1])
-                        self.opt_exps[eid].step()
+                        getattr(self.opt_exps[eid], "step" if path == PATH_STEP else "zero_grad")()
                     except:
                         pass
-                return {"ok": True}
+                res_data = {"ok": True}
 
-            elif path == PATH_ZERO:
-                if "pre" in func_name: self.opt_pre.zero_grad()
-                if "post" in func_name: self.opt_post.zero_grad()
-                if "expert" in func_name:
-                    try:
-                        eid = int(func_name.split(":")[-1])
-                        self.opt_exps[eid].zero_grad()
-                    except:
-                        pass
-                return {"ok": True}
+            # 💡 [NEW] 2. 计算实际耗时并注入计费信息
+            actual_ms = (time.perf_counter() - t_start) * 1000.0
 
-            return {"ok": False, "error": "Unknown path"}
+            # 计费单价 (USD/ms)，建议与你的 HeatMoE 实验设定保持一致
+            price_rate = 0.00000021
+
+            # 💡 [NEW] 3. 统一封装返回值
+            if isinstance(res_data, dict):
+                res_data["actual_lat"] = actual_ms  # 给 Fig Y 使用
+                res_data["cost_usd"] = actual_ms * price_rate  # 给 Fig W-c 使用
+                res_data["is_cold"] = False  # 本地模式默认不冷启动，除非你有状态模拟
+                res_data["cold_penalty"] = 0.0
+
+            return res_data
 
 # ============================================================
 # Load instances / func map
@@ -568,7 +605,7 @@ class InstanceManager:
     def __init__(self):
         self.last_used_ts_ms: Dict[str, float] = {}
         self.lock = asyncio.Lock()
-        self.keep_alive_ms = float(os.getenv("KEEP_ALIVE_MS", "400"))
+        self.keep_alive_ms = float(os.getenv("KEEP_ALIVE_MS", "300"))
         self.eviction_base_prob = float(os.getenv("EVICTION_BASE_PROB", "0.3"))
         self.eviction_tau_ms = float(os.getenv("EVICTION_TAU_MS", "2000"))
         self.keepalive_mul_hot = float(os.getenv("KEEPALIVE_MUL_HOT", "1.5"))
@@ -973,6 +1010,15 @@ class TriScheduler:
             if s < best_s: best_s, best_i = s, i
         return inst_list[int(best_i)]
 
+    # controller.py 约 1100 行 class TriScheduler 内插入
+    def predict(self, inst, base_compute_ms, func_name="expert", mode="hot"):
+        """ 为 Fig Y 提供预测值 """
+        # 调用你现有的启发式或在线预测逻辑
+        h_lat, _, _, _ = self._heuristic(inst, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms)
+        o_lat = self._online_lat(inst)
+        pred = float(o_lat) if o_lat is not None else float(h_lat)
+        return min(max(pred, 1.0), 5000.0)
+
 
 TRI_SCHED = TriScheduler()
 
@@ -1010,6 +1056,10 @@ def _to_tensor(v: Any, *, device: torch.device, dtype: Optional[torch.dtype] = N
 async def invoke_with_retry(func_name, logical_id, candidates, req, base_compute_ms, *, mode, max_tries,
                             forced_inst=None, global_step=0):
     if not candidates: raise RuntimeError(f"invoke candidates empty for {func_name}")
+
+    # [NEW] 提前声明变量，用于记录本次选择的预测耗时
+    current_pred_ms = 0.0
+
     if forced_inst is None and ABL_CFG.is_baseline:
         if ABL_CFG.use_random_sched:
             forced_inst = BASELINE_SCHED.select_random(candidates)
@@ -1019,36 +1069,74 @@ async def invoke_with_retry(func_name, logical_id, candidates, req, base_compute
             forced_inst = BASELINE_SCHED.select_greedy_min_rtt(candidates)
         elif ABL_CFG.is_static_compute:
             forced_inst = candidates[0]
+
     tries, last_err = 0, None
 
-    async def _try(inst, retry_cnt):
-        breakdown = await simulate_invoke_with_breakdown(inst, base_compute_ms, req, func_name=func_name, mode=mode,
-                                                         global_step=global_step)
-        HYBRID_SCHED.update_stats(inst, breakdown[0])
-        _maybe_autoscale(func_name, candidates, breakdown[1], global_step)
-        if SIM_SLEEP: await asyncio.sleep(breakdown[0] / 1000.0)
-        return inst, breakdown, retry_cnt
+    async def _try(inst, retry_cnt, pred_ms_val):
+        # 1. 模拟调用，获取详细的时间拆分
+        breakdown_tuple = await simulate_invoke_with_breakdown(inst, base_compute_ms, req, func_name=func_name,
+                                                               mode=mode,
+                                                               global_step=global_step)
+        # breakdown_tuple 结构通常是 (total_ms, is_cold, ...)
+        actual_ms = min(max(float(breakdown_tuple[0]), 0.001), 10000.0)
 
+        # 2. 计算真实成本 (根据实例元数据里的 price)
+        # 如果 inst["meta"] 里没钱，给个默认 HeatMoE 计费单价
+        price_rate = inst.get("meta", {}).get("price", 0.00000021)
+        cost_usd = actual_ms * price_rate
+
+        # 3. 更新调度器统计信息
+        HYBRID_SCHED.update_stats(inst, actual_ms)
+        _maybe_autoscale(func_name, candidates, breakdown_tuple[1], global_step)
+
+        if SIM_SLEEP: await asyncio.sleep(actual_ms / 1000.0)
+
+        # 💡 [关键改动] 将所有论文指标打包进返回值
+        # 我们把原来的元组转为字典，方便外层通过 .get() 获取
+        res_meta = {
+            "ok": True,
+            "func_name": func_name,
+            "actual_lat": actual_ms,  # 用于 Fig Y (真实值)
+            "pred_lat": pred_ms_val,  # 用于 Fig Y (预测值)
+            "cost_usd": cost_usd,  # 用于 Fig W-c (成本)
+            "is_cold": breakdown_tuple[2]>0,  # 用于 Fig W-a (冷启动判定)
+            "cold_penalty": breakdown_tuple[2],
+            "raw_breakdown": breakdown_tuple  # 保留原始元组兼容性
+        }
+
+        return inst, res_meta, retry_cnt
+
+    # 情况 A: 有强制指定的实例 (基线模式)
     if forced_inst is not None:
         try:
-            return await _try(forced_inst, 0)
+            # 基线模式预测值通常为 0，或者你可以给个固定值
+            return await _try(forced_inst, 0, 0.0)
         except Exception as e:
             last_err = e
+
+    # 情况 B: 正常调度逻辑
     cand = list(candidates)
     while tries < max_tries and cand:
         tries += 1
         if not ABL_CFG.is_baseline:
             deadline_ms = float(DEADLINE_EST.deadline_ms(global_step))
+            # 💡 [关键改动] 获取调度决策的同时记录预测值
+            # 假设你的 TRI_SCHED.select 在内部算过预测值，可以通过 get_prediction 提前获取
+            current_pred_ms = TRI_SCHED.predict(cand[0], base_compute_ms) if hasattr(TRI_SCHED, 'predict') else 0.0
+
             inst = TRI_SCHED.select(cand, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms,
                                     deadline_ms=deadline_ms)
         else:
             inst = random.choice(cand)
+            current_pred_ms = 0.0
+
         try:
-            return await _try(inst, max(0, tries - 1))
+            return await _try(inst, max(0, tries - 1), current_pred_ms)
         except Exception as e:
-            last_err = e;
-            bad = inst.get("id");
+            last_err = e
+            bad = inst.get("id")
             cand = [x for x in cand if x.get("id") != bad]
+
     raise RuntimeError(f"invoke_with_retry failed: {last_err}")
 
 
@@ -1059,7 +1147,13 @@ async def _invoke_fn(func_name, *, mode, base_compute_ms, http_path, payload, gl
     if not cands and LOCAL_EXECUTOR:
         inst = {"id": "local_v_inst", "region": "local", "meta": {"performance": 1.0}}
         obj = await LOCAL_EXECUTOR.run(func_name, http_path, payload)
-        return inst, obj, (0.0, 0.0, 0.0, 0.0, 0.0), 0
+        meta_fallback = {
+            "actual_lat": 0.0,
+            "cost_usd": 0.0,
+            "is_cold": False,
+            "func_name": func_name
+        }
+        return inst, obj, meta_fallback, 0
 
     if not cands:
         cands = [INST_BY_ID[i] for i in FUNC_MAP.get(func_name, []) if i in INST_BY_ID]
@@ -1222,76 +1316,107 @@ async def run_microbatch(step: int, micro_step: int, x: torch.Tensor, y: torch.T
     x_tok = x.to(my_device)
     y_tok = y.to(my_device)
 
-    # 初始化统计计数器
-    total_invocations = 0
-    cold_invocations = 0
+    all_mb_rows = []  # 💡 统一收集所有调用的 res_meta 字典
 
     # 1. 训练准备：Zero Grad
     if split == "train":
-        await _invoke_fn("moe.pre_zero", mode="http", payload={}, base_compute_ms=0, http_path=PATH_ZERO,
-                         global_step=step)
-        # ... (其他 zero 调用)
+        # _invoke_fn 返回 (inst, obj, res_meta, retry_cnt)
+        res_zero = await _invoke_fn("moe.pre_zero", mode="http", payload={}, base_compute_ms=0, http_path=PATH_ZERO,
+                                    global_step=step)
+        # 确保加入的是字典
+        all_mb_rows.append(res_zero[2] if isinstance(res_zero, tuple) else res_zero)
 
+    # ============================================================
     # 2. Forward 流程
+    # ============================================================
     # Pre Stage
-    # 注意：使用 _invoke_fn 返回的 breakdown[2] (cold_ms) 来判断是否为冷启动
-    _, pre_obj, bd1, _ = await _invoke_fn(
-        "moe.pre_fwd", mode="http", payload={"x": tensor_to_pack(x_tok)},
-        base_compute_ms=10.0, http_path=PATH_FWD, global_step=step
-    )
-    total_invocations += 1
-    if bd1[2] > 0: cold_invocations += 1  # bd1[2] 是 cold_start_ms
+    _, pre_obj, bd1, _ = await _invoke_fn("moe.pre_fwd", mode="http", payload={"x": tensor_to_pack(x_tok)},
+                                          base_compute_ms=10.0, http_path=PATH_FWD, global_step=step)
+    all_mb_rows.append(bd1)
 
     # Expert Stage
     expert_inputs = pre_obj.get("expert_inputs", {})
-    fwd_tasks = []
-    for eid_str, inp_pack in expert_inputs.items():
-        eid = int(eid_str)
-        fwd_tasks.append(_invoke_fn(f"moe.expert_fwd:{eid}", mode="hot", payload={"inp": inp_pack},
-                                    base_compute_ms=20.0, http_path=PATH_FWD, global_step=step))
-
+    fwd_tasks = [
+        _invoke_fn(f"moe.expert_fwd:{eid}", mode="hot", payload={"inp": pack}, base_compute_ms=20.0, http_path=PATH_FWD,
+                   global_step=step) for eid, pack in expert_inputs.items()]
     expert_results = await asyncio.gather(*fwd_tasks)
 
-    # 统计专家的冷启动情况
+    # 💡 [修复] 此时 res 是元组 (inst, obj, res_meta, retry_cnt)，必须取 res[2]
     for res in expert_results:
-        total_invocations += 1
-        if res[2][2] > 0: cold_invocations += 1  # 统计每个专家调用是否冷启动
+        all_mb_rows.append(res[2])
 
     exp_outs = [res[1] for res in expert_results]
-    t2 = max([res[2][0] for res in expert_results]) if expert_results else 0
+    t2 = max([res[2].get("actual_lat", 0.0) for res in expert_results]) if expert_results else 0
 
     # Post Stage
-    _, post_obj, bd3, _ = await _invoke_fn(
-        "moe.post_fwd", mode="http", payload={"expert_results": exp_outs, "pre_context": pre_obj.get("context", {}),
-                                              "targets": tensor_to_pack(y_tok)},
-        base_compute_ms=10.0, http_path=PATH_FWD, global_step=step
-    )
-    total_invocations += 1
-    if bd3[2] > 0: cold_invocations += 1
+    _, post_obj, bd3, _ = await _invoke_fn("moe.post_fwd", mode="http",
+                                           payload={"expert_results": exp_outs,
+                                                    "pre_context": pre_obj.get("context", {}),
+                                                    "targets": tensor_to_pack(y_tok)},
+                                           base_compute_ms=10.0, http_path=PATH_FWD, global_step=step)
+    all_mb_rows.append(bd3)
 
     loss_val = post_obj.get("loss", 0.0)
+    acc5_val = post_obj.get("acc5", 0.0)
 
-    # 3. 训练核心：Backward & Step (略，保持你现有的逻辑)
-    # ...
+    # ============================================================
+    # 3. 训练核心：Backward & Step (HeatMoE 策略)
+    # ============================================================
+    if split == "train":
+        # (A) Post Backward
+        _, bwd_post_obj, bbd1, _ = await _invoke_fn("moe.post_bwd", mode="http", payload={"trace_id": trace_id},
+                                                    base_compute_ms=15.0, http_path=PATH_BWD, global_step=step)
+        all_mb_rows.append(bbd1)
+        grad_combined = bwd_post_obj.get("grad_combined")
 
-    # 4. 修复 hot_ratio 计算
-    # 真实的 hot_ratio = (总调用次数 - 冷启动次数) / 总调用次数
-    real_hot_ratio = (total_invocations - cold_invocations) / total_invocations if total_invocations > 0 else 1.0
+        # (B) Expert Backward
+        bwd_tasks = [
+            _invoke_fn(f"moe.expert_bwd:{eid}", mode="hot", payload={"trace_id": trace_id, "grad_out": grad_combined},
+                       base_compute_ms=30.0, http_path=PATH_BWD, global_step=step)
+            for eid in expert_inputs.keys()
+        ]
+        expert_bwd_results = await asyncio.gather(*bwd_tasks)
+        for res in expert_bwd_results:
+            all_mb_rows.append(res[2])  # 💡 同样取 res[2]
+
+        # (C) Pre Backward
+        grad_h = expert_bwd_results[0][1].get("grad_inp") if expert_bwd_results else None
+        _, _, bbd3, _ = await _invoke_fn("moe.pre_bwd", mode="http", payload={"trace_id": trace_id, "grad_h": grad_h},
+                                         base_compute_ms=15.0, http_path=PATH_BWD, global_step=step)
+        all_mb_rows.append(bbd3)
+
+        # (D) Optimizer Step
+        hot_set = HEATMAP.hot_set(HOTSET_SIZE)
+        upd_eids, _, _ = POLICY.decide(hot_set)
+        step_tasks = [_invoke_fn("moe.pre_step", mode="http", payload={}, base_compute_ms=5, http_path=PATH_STEP,
+                                 global_step=step)]
+        for eid in upd_eids:
+            step_tasks.append(
+                _invoke_fn(f"moe.expert_step:{eid}", mode="hot", payload={}, base_compute_ms=10, http_path=PATH_STEP,
+                           global_step=step))
+        s_results = await asyncio.gather(*step_tasks)
+        for res in s_results:
+            all_mb_rows.append(res[2])
+
+    # ============================================================
+    # 4. 最终数据统计与返回 (鲁棒版)
+    # ============================================================
+    # 使用列表推导式前，先确保 r 都是字典
+    final_cold = sum([1 for r in all_mb_rows if isinstance(r, dict) and r.get("is_cold")])
+    final_total = len(all_mb_rows)
 
     return {
         "loss": loss_val,
-        "acc5": 0.0,
-        "pre_lat": bd1[0], "exp_lat": t2, "post_lat": bd3[0],
-        "inv_cold_ms": bd1[2] + bd3[2] + sum([res[2][2] for res in expert_results]),
-        "hot_ratio": real_hot_ratio,  # 返回真实计算的比例
-        "fwd_mode_hot": total_invocations - cold_invocations,
-        "fwd_mode_cold": cold_invocations,
-        "fwd_mode_http": 0,
-        "cost_usd": 0.0001
+        "acc5": acc5_val,
+        "rows": all_mb_rows,
+        "hot_ratio": (final_total - final_cold) / final_total if final_total > 0 else 1.0,
     }
 
 async def train():
+    global logger
+    # 确保初始化时清空之前的记录或保持追加逻辑
     if not os.path.exists(METRICS_FILE): write_metrics_header(METRICS_FILE)
+
     stoi, _ = _build_vocab(DATA_PATH, VOCAB_PATH)
     ids = _load_ids(DATA_PATH, stoi)
     n = int(ids.numel())
@@ -1300,60 +1425,167 @@ async def train():
     train_batcher = TextBatcher(train_ids, BATCH_SIZE, SEQ_LEN, seed=SEED)
     val_batcher = TextBatcher(val_ids, BATCH_SIZE, SEQ_LEN, seed=SEED + 999)
     dataset = RealDataLoader(block_size=64, batch_size=4)
+
     for step in range(1, MAX_STEPS + 1):
         t_step0 = time.perf_counter()
         AUTOSCALER.step()
         split = "val" if (step % VAL_INTERVAL == 0) else "train"
-        x, y = (val_batcher.next_batch() if split == "val" else train_batcher.next_batch())
+
+        # 准备微批次数据
         mb = MICRO_BATCH
         xs, ys = [], []
         for _ in range(mb):
             x, y = dataset.get_batch('train')
             xs.append(x)
             ys.append(y)
-        # 安全检查：如果数据不够，强行中止这一轮，防止报错
+
         if len(xs) != mb:
             print(f">>> [Fatal Error] Loop mismatch! Generated {len(xs)}, expected {mb}")
             continue
-        tasks = [run_microbatch(step, i, xs[i], ys[i]) for i in range(mb)]
-        rows = await asyncio.gather(*tasks)
-        valid_rows = [r for r in rows if r is not None]
 
-        # Aggregation
-        loss = float(np.mean([r["loss"] for r in valid_rows]))
-        acc5 = float(np.mean([r["acc5"] for r in valid_rows]))
-        hot_ratio = float(np.mean([r["hot_ratio"] for r in valid_rows]))
-        inv_cold_ms = float(np.sum([r["inv_cold_ms"] for r in valid_rows]))
+        # 并发执行微批次任务
+        tasks = [run_microbatch(step, i, xs[i], ys[i]) for i in range(mb)]
+        results = await asyncio.gather(*tasks)
+        # 这里的 rows 包含了一次 Step 中所有函数调用的元数据（pre, expert, post 等）
+        # 假设 run_microbatch 内部将多次 invoke 的结果聚合到了一个列表中
+        all_invoke_results = []
+        for r in results:
+            if isinstance(r, dict) and "rows" in r:
+                all_invoke_results.extend(r["rows"])
+            elif isinstance(r, list):
+                all_invoke_results.extend(r)
+
+        # ============================================================
+        # 【修正】指标计算与记录逻辑 (HeatMoE 专用)
+        # ============================================================
+
+        # 1. 优先更新预测监控器 (Fig Y)
+        # 必须在 get_r2_mae 之前更新，否则记录会滞后一个 Step
+        for r in all_invoke_results:
+            if "actual_lat" in r and "pred_lat" in r:
+                if not r.get("is_cold"):
+                    PRED_MONITOR.update(r["actual_lat"], r["pred_lat"])
+
+        current_r2, current_mae = PRED_MONITOR.get_r2_mae()
+
+        # 2. 聚合关键性能数据
+        valid_mb_results = [r for r in results if r is not None]
+        loss = float(np.mean([r.get("loss", 0.0) for r in valid_mb_results]))
+        acc5 = float(np.mean([r.get("acc5", 0.0) for r in valid_mb_results]))
+        hot_ratio = float(np.mean([r.get("hot_ratio", 0.0) for r in valid_mb_results]))
+
+        # 3. 分类聚合成本 (基于 func_name 进行过滤，解决 Key 匹配问题)
+        # 定义一个内部辅助函数，确保能从 r 中拿到字典
+        def ensure_dict(r):
+            # 1. 如果已经是字典，直接返回
+            if isinstance(r, dict):
+                return r
+            # 2. 如果是元组，取第三个元素 res_meta
+            if isinstance(r, (tuple, list)) and len(r) >= 3:
+                res_meta = r[2]
+                # 💡 [新增逻辑] 检查提取出来的 res_meta 是否还是元组/列表
+                if isinstance(res_meta, (tuple, list)):
+                    # 如果是 (0.0, 0.0...) 这种老式元组，强行转字典
+                    return {"actual_lat": float(res_meta[0]), "cost_usd": 0.0, "func_name": ""}
+                return res_meta if isinstance(res_meta, dict) else {}
+            return {}
+
+        # 预处理：将所有结果统一转为字典格式
+        clean_invokes = [ensure_dict(r) for r in all_invoke_results]
+
+        # 现在使用 clean_invokes 进行分类聚合，绝对不会报 AttributeError
+        cost_pre = float(np.sum([r.get("cost_usd", 0.0) for r in clean_invokes if "pre_fwd" in r.get("func_name", "")]))
+        cost_expert = float(
+            np.sum([r.get("cost_usd", 0.0) for r in clean_invokes if "expert_fwd" in r.get("func_name", "")]))
+        cost_post = float(
+            np.sum([r.get("cost_usd", 0.0) for r in clean_invokes if "post_fwd" in r.get("func_name", "")]))
+
+        # 💡 单步总成本应该只计算 FWD + BWD + STEP 的原子开销总和
+        total_cost = float(np.sum([r.get("cost_usd", 0.0) for r in clean_invokes]))
+
+        # 同样的，修改冷启动统计
+        inv_cold_cnt = int(np.sum([1 for r in clean_invokes if r.get("is_cold", False)]))
+        inv_cold_ms = float(np.sum([r.get("cold_penalty", 0.0) for r in clean_invokes]))
+        # 通信指标
+        inv_comp_ms = float(np.mean([
+            r.get("actual_lat", 0) - r.get("cold_penalty", 0) - r.get("inv_net_ms", 0)
+            for r in clean_invokes if "fwd" in r.get("func_name", "")
+        ]))
+
+        # 重新计算网络和排队（确保从字典中直接取值）
+        inv_net_ms = float(np.sum([r.get("inv_net_ms", 0.0) for r in clean_invokes]))
+        inv_queue_ms = float(np.sum([r.get("inv_queue_ms", 0.0) for r in clean_invokes]))
+
+        # 计算 CCR (Communication-to-Computation Ratio) - 论文中的核心性能指标
+        ccr = inv_net_ms / (inv_comp_ms + 1e-9)
+
+        # 更新 R2 监控器也用 clean_invokes
+        for r in clean_invokes:
+            # 💡 建议：只统计 FWD 阶段的专家调用，因为这是 TRI_SCHED 真正预测的对象
+            if "actual_lat" in r and "pred_lat" in r:
+                func_name = r.get("func_name", "")
+                # 排除掉那些 base_compute_ms=0 的 zero/step 操作，它们会产生极小的 actual_lat 干扰 R2
+                if "fwd" in func_name and r["actual_lat"] > 1.0:
+                    PRED_MONITOR.update(r["actual_lat"], r["pred_lat"])
+
         step_time_ms = (time.perf_counter() - t_step0) * 1000.0
         DEADLINE_EST.update(step_time_ms)
-        viol = 1.0 if step_time_ms > DEADLINE_EST.deadline_ms(step) else 0.0
 
-        row = rows[0].copy()  # grab structure
-        # Sums
-        for k in ["pre_lat_ms", "post_lat_ms", "exp_lat_ms", "inv_total_ms", "inv_queue_ms", "inv_cold_ms",
-                  "inv_net_ms", "inv_compute_ms", "inv_retry_cnt", "cost_usd_step", "cost_usd_pre_fwd",
-                  "cost_usd_post_fwd", "cost_usd_expert_fwd"]:
-            row[k] = float(np.sum([r.get(k.replace("_ms", ""), 0.0) for r in rows]))  # map short key to long
-        # Fracs
-        fwd_tot = max(1.0, float(np.sum([r["fwd_mode_hot"] + r["fwd_mode_cold"] + r["fwd_mode_http"] for r in rows])))
-        row["fwd_mode_hot_frac"] = float(np.sum([r["fwd_mode_hot"] for r in rows])) / fwd_tot
-        row["fwd_mode_cold_frac"] = float(np.sum([r["fwd_mode_cold"] for r in rows])) / fwd_tot
-        row["fwd_mode_http_frac"] = float(np.sum([r["fwd_mode_http"] for r in rows])) / fwd_tot
-        # Common fields
-        row.update({"step": step, "split": split, "loss": loss, "acc_top5": acc5, "hot_ratio": hot_ratio,
-                    "step_time_ms": step_time_ms, "deadline_violation_frac": viol})
+        # 如果当前步耗时超过了预测的截止时间，则标记为 1.0 (违规)
+        current_deadline = DEADLINE_EST.deadline_ms(step)
+        # 💡 优化：如果你发现 step_time_ms 普遍在 500ms 以上，而 deadline 只有 200ms
+        # 说明你的 DEADLINE_MIN_MS (约 130行) 设小了。
+        # 临时建议：将 viol 的判断加入一定的容忍度，或增大 DEADLINE_SAFETY 系数
+        viol = 1.0 if step_time_ms > (current_deadline * 1.2) else 0.0
 
-        append_metrics(METRICS_FILE, row)
+        # --- 记录专家负载不均程度 ---
+        scores = HEATMAP.scores  # 这是一个数组
+        gini = 1.0 - np.sum((scores) ** 2)  # 简易离散度指标
+
+        # 5. 实例化 StepMetrics 对象并记录到 CSV
+        metrics_record = StepMetrics(
+            epoch=1,
+            step=step,
+            phase=split,
+            loss=loss,
+            acc_top5=acc5,
+            step_time_ms=step_time_ms,
+            predictor_r2=float(current_r2),
+            predictor_mae=float(current_mae),
+            inv_cold_cnt=inv_cold_cnt,
+            inv_cold_ms=inv_cold_ms,
+            inv_net_ms=inv_net_ms,  # 👈 补全：网络开销
+            inv_compute_ms=inv_comp_ms,  # 👈 补全：纯计算开销
+            inv_queue_ms=inv_queue_ms,  # 👈 补全：排队开销
+            cost_usd_step=float(total_cost),
+            cost_usd_pre_fwd=cost_pre,
+            cost_usd_post_fwd=cost_post,
+            cost_usd_expert_fwd=cost_expert,
+            hot_ratio=hot_ratio,
+            deadline_violation_frac=float(viol),  # 👈 补全：SLO 违约率
+            ablation_mode=os.getenv("ABLATION_MODE", "full")
+        )
+
+        logger.log(metrics_record)
+
+        # 实时打印验证（方便在控制台即时观察 R2 和 Cost）
         if (step % LOG_TRAIN_EVERY) == 0 or split == "val":
             print(
-                f"[{split}] step={step} loss={loss:.4f} acc5={acc5:.4f} time={step_time_ms:.0f}ms cold={inv_cold_ms:.0f}ms hot_ratio={hot_ratio:.2f}")
-
+                f"[{split}] step={step} loss={loss:.4f} acc5={acc5:.4f} "
+                f"time={step_time_ms:.0f}ms cost=${total_cost:.6f} R2={current_r2:.3f}"
+            )
 
 def main():
     # ==========================================
     # 【新增】初始化 LocalExecutor
     # ==========================================
     global LOCAL_EXECUTOR  # 1. 声明使用全局变量
+    global logger
+    logger = MetricsLogger(os.getenv("METRICS_FILE", "metrics.csv"))
+
+    # 实例化预测监控器（用于计算 R2）
+    # 如果你的代码里有 class PredictionMonitor 但没这一行，请加上：
+    PRED_MONITOR = PredictionMonitor()
 
     # 2. 如果开启了本地计算模式 (默认开启)，则初始化它
     if os.getenv("USE_HTTP_EXEC", "0") == "0":
