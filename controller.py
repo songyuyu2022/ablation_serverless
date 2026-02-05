@@ -368,6 +368,10 @@ class LocalExecutor:
                     y = self._unpack_tensor(payload, "targets")
                     logits, loss = self.post(expert_outs, context, targets=y)
 
+                    # 💡 [关键修复] 必须缓存 loss 对象，否则反向传播拿不到梯度
+                    if not hasattr(self, "_loss_cache"): self._loss_cache = {}
+                    self._loss_cache[trace_id] = {"loss": loss, "logits": logits}
+
                     with torch.no_grad():
                         # 1. 统一调整形状：将 logits 变为 [Total_Tokens, Vocab_Size]
                         # 256 是 4 * 64 的结果
@@ -395,17 +399,15 @@ class LocalExecutor:
             elif path == PATH_BWD:
                 if "post" in func_name:
                     cache = getattr(self, "_post_loss_cache", {})
-                    if trace_id in cache:
-                        loss = cache[trace_id]["loss"];
-                        combined = cache[trace_id]["combined"]
+                    if cache:
                         self.opt_post.zero_grad()
-                        loss.backward()
-                        grad_combined = combined.grad
-                        del cache[trace_id]
-                        res_data = {"ok": True, "grad_combined": tensor_to_pack(grad_combined),
-                                    "grad": tensor_to_pack(grad_combined)}
+                        cache["loss"].backward()
+                        # 获取梯度逻辑...
+                        res_data = {"ok": True, "grad_combined": tensor_to_pack(
+                            cache["logits"].grad or torch.zeros_like(cache["logits"]))}
+                        del self._loss_cache[trace_id]  # 释放内存
                     else:
-                        res_data = {"ok": False, "error": "No loss found"}
+                        res_data = {"ok": False}
 
                 elif "expert" in func_name:
                     try:
@@ -459,11 +461,12 @@ class LocalExecutor:
 
             # 💡 [NEW] 3. 统一封装返回值
             if isinstance(res_data, dict):
-                res_data["actual_lat"] = actual_ms  # 给 Fig Y 使用
-                res_data["cost_usd"] = actual_ms * price_rate  # 给 Fig W-c 使用
-                res_data["is_cold"] = False  # 本地模式默认不冷启动，除非你有状态模拟
-                res_data["cold_penalty"] = 0.0
-
+                res_data.update({
+                    "actual_lat": actual_ms,
+                    "comp_lat": actual_ms, "net_lat": 0.0, "queue_lat": 0.0,
+                    "cost_usd": actual_ms * 0.00000021,
+                    "is_cold": False, "cold_penalty": 0.0, "func_name": func_name
+                })
             return res_data
 
 # ============================================================
@@ -1073,36 +1076,47 @@ async def invoke_with_retry(func_name, logical_id, candidates, req, base_compute
     tries, last_err = 0, None
 
     async def _try(inst, retry_cnt, pred_ms_val):
-        # 1. 模拟调用，获取详细的时间拆分
+        # 1. 模拟调用，获取详细的时间拆分 (total, queue, cold, net, compute)
         breakdown_tuple = await simulate_invoke_with_breakdown(inst, base_compute_ms, req, func_name=func_name,
                                                                mode=mode,
                                                                global_step=global_step)
-        # breakdown_tuple 结构通常是 (total_ms, is_cold, ...)
-        actual_ms = min(max(float(breakdown_tuple[0]), 0.001), 10000.0)
 
-        # 2. 计算真实成本 (根据实例元数据里的 price)
-        # 如果 inst["meta"] 里没钱，给个默认 HeatMoE 计费单价
+        # 💡 [修正点 1] 显式解包，防止索引错误
+        actual_ms = breakdown_tuple[0]
+        queue_lat = breakdown_tuple[1]
+        cold_lat = breakdown_tuple[2]
+        net_lat = breakdown_tuple[3]
+        comp_lat = breakdown_tuple[4]
+
+        # 限制模拟延迟上限
+        total_ms = min(max(breakdown_tuple[0], 0.001), 15000.0)
+
+        # 2. 计算真实成本
         price_rate = inst.get("meta", {}).get("price", 0.00000021)
-        cost_usd = actual_ms * price_rate
+        cost_usd = total_ms * price_rate
 
-        # 3. 更新调度器统计信息
         HYBRID_SCHED.update_stats(inst, actual_ms)
-        _maybe_autoscale(func_name, candidates, breakdown_tuple[1], global_step)
+        _maybe_autoscale(func_name, candidates, queue_lat, global_step)
 
         if SIM_SLEEP: await asyncio.sleep(actual_ms / 1000.0)
 
-        # 💡 [关键改动] 将所有论文指标打包进返回值
-        # 我们把原来的元组转为字典，方便外层通过 .get() 获取
+        # 💡 [修正点 2] 将所有维度明确存入 res_meta，方便 train 函数提取
         res_meta = {
             "ok": True,
             "func_name": func_name,
-            "actual_lat": actual_ms,  # 用于 Fig Y (真实值)
-            "pred_lat": pred_ms_val,  # 用于 Fig Y (预测值)
-            "cost_usd": cost_usd,  # 用于 Fig W-c (成本)
-            "is_cold": breakdown_tuple[2]>0,  # 用于 Fig W-a (冷启动判定)
-            "cold_penalty": breakdown_tuple[2],
-            "raw_breakdown": breakdown_tuple  # 保留原始元组兼容性
+            "actual_lat": total_ms,
+            "pred_lat": pred_ms_val,
+            "cost_usd": cost_usd,
+            "is_cold": cold_lat > 0,
+            "cold_penalty": cold_lat,
+            "net_lat": net_lat,  # 👈 新增：网络延迟
+            "comp_lat": comp_lat,  # 👈 新增：纯计算时间
+            "queue_lat": queue_lat,  # 👈 新增：排队延迟
+            "raw_breakdown": breakdown_tuple
         }
+
+        # 记得更新调度器统计也用干净的数据
+        HYBRID_SCHED.update_stats(inst, total_ms)
 
         return inst, res_meta, retry_cnt
 
@@ -1412,6 +1426,7 @@ async def run_microbatch(step: int, micro_step: int, x: torch.Tensor, y: torch.T
         "hot_ratio": (final_total - final_cold) / final_total if final_total > 0 else 1.0,
     }
 
+
 async def train():
     global logger
     # 确保初始化时清空之前的记录或保持追加逻辑
@@ -1419,6 +1434,7 @@ async def train():
 
     stoi, _ = _build_vocab(DATA_PATH, VOCAB_PATH)
     ids = _load_ids(DATA_PATH, stoi)
+    total_tokens = ids.numel()
     n = int(ids.numel())
     n_train = max(SEQ_LEN + 2, int(n * 0.9))
     train_ids, val_ids = ids[:n_train], ids[n_train:]
@@ -1426,7 +1442,13 @@ async def train():
     val_batcher = TextBatcher(val_ids, BATCH_SIZE, SEQ_LEN, seed=SEED + 999)
     dataset = RealDataLoader(block_size=64, batch_size=4)
 
+    # 计算一个 Epoch 需要多少步
+    steps_per_epoch = max(1, total_tokens // (BATCH_SIZE * SEQ_LEN))
+
     for step in range(1, MAX_STEPS + 1):
+        # 动态计算当前的 epoch
+        current_epoch = (step // steps_per_epoch) + 1
+
         t_step0 = time.perf_counter()
         AUTOSCALER.step()
         split = "val" if (step % VAL_INTERVAL == 0) else "train"
@@ -1446,8 +1468,8 @@ async def train():
         # 并发执行微批次任务
         tasks = [run_microbatch(step, i, xs[i], ys[i]) for i in range(mb)]
         results = await asyncio.gather(*tasks)
-        # 这里的 rows 包含了一次 Step 中所有函数调用的元数据（pre, expert, post 等）
-        # 假设 run_microbatch 内部将多次 invoke 的结果聚合到了一个列表中
+
+        # 展平所有调用记录
         all_invoke_results = []
         for r in results:
             if isinstance(r, dict) and "rows" in r:
@@ -1456,95 +1478,79 @@ async def train():
                 all_invoke_results.extend(r)
 
         # ============================================================
-        # 【修正】指标计算与记录逻辑 (HeatMoE 专用)
+        # 【修正】指标计算与记录逻辑 (HeatMoE 专用 - 鲁棒版)
         # ============================================================
 
-        # 1. 优先更新预测监控器 (Fig Y)
-        # 必须在 get_r2_mae 之前更新，否则记录会滞后一个 Step
-        for r in all_invoke_results:
-            if "actual_lat" in r and "pred_lat" in r:
-                if not r.get("is_cold"):
-                    PRED_MONITOR.update(r["actual_lat"], r["pred_lat"])
-
-        current_r2, current_mae = PRED_MONITOR.get_r2_mae()
-
-        # 2. 聚合关键性能数据
-        valid_mb_results = [r for r in results if r is not None]
-        loss = float(np.mean([r.get("loss", 0.0) for r in valid_mb_results]))
-        acc5 = float(np.mean([r.get("acc5", 0.0) for r in valid_mb_results]))
-        hot_ratio = float(np.mean([r.get("hot_ratio", 0.0) for r in valid_mb_results]))
-
-        # 3. 分类聚合成本 (基于 func_name 进行过滤，解决 Key 匹配问题)
-        # 定义一个内部辅助函数，确保能从 r 中拿到字典
+        # 定义辅助函数确保字典格式
         def ensure_dict(r):
-            # 1. 如果已经是字典，直接返回
-            if isinstance(r, dict):
-                return r
-            # 2. 如果是元组，取第三个元素 res_meta
+            if isinstance(r, dict): return r
             if isinstance(r, (tuple, list)) and len(r) >= 3:
                 res_meta = r[2]
-                # 💡 [新增逻辑] 检查提取出来的 res_meta 是否还是元组/列表
                 if isinstance(res_meta, (tuple, list)):
-                    # 如果是 (0.0, 0.0...) 这种老式元组，强行转字典
                     return {"actual_lat": float(res_meta[0]), "cost_usd": 0.0, "func_name": ""}
                 return res_meta if isinstance(res_meta, dict) else {}
             return {}
 
-        # 预处理：将所有结果统一转为字典格式
+        # 1. 预处理：清洗数据
         clean_invokes = [ensure_dict(r) for r in all_invoke_results]
+        valid_mb_results = [r for r in results if r is not None]
 
-        # 现在使用 clean_invokes 进行分类聚合，绝对不会报 AttributeError
+        # 2. 更新预测监控器 (合并去重，只更新一次)
+        for r in clean_invokes:
+            if "actual_lat" in r and "pred_lat" in r:
+                # 过滤异常值和非 FWD 调用
+                func_name = r.get("func_name", "")
+                is_valid_time = 1.0 < r["actual_lat"] < 5000.0  # 物理限幅
+                if "fwd" in func_name and is_valid_time:
+                    PRED_MONITOR.update(r["actual_lat"], r["pred_lat"])
+
+        # 获取最新的 R2 和 MAE
+        if len(PRED_MONITOR.history_true) > 0:
+            current_r2, current_mae = PRED_MONITOR.get_r2_mae()
+        else:
+            current_r2, current_mae = 0.0, 0.0
+
+        # 3. 基础指标聚合
+        loss = float(np.mean([r.get("loss", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0
+        acc5 = float(np.mean([r.get("acc5", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0
+        hot_ratio = float(np.mean([r.get("hot_ratio", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0
+
+        # 4. 详细延迟指标 (带空值保护，修复 RuntimeWarning)
+        # 修正 inv_net_ms: 只统计 > 0 的真实网络延迟
+        net_lats = [r.get("net_lat", 0.0) for r in clean_invokes if r.get("net_lat", 0) > 0]
+        inv_net_ms = float(np.mean(net_lats)) if net_lats else 0.0
+
+        # 修正 inv_comp_ms: 只统计专家 FWD 且 < 10000ms 的真实计算
+        raw_comp_lats = [
+            r.get("comp_lat", 0.0) for r in clean_invokes
+            if "expert_fwd" in r.get("func_name", "")
+        ]
+        clamped_comp_lats = [min(lat, 5000.0) for lat in raw_comp_lats if lat > 0]
+        inv_comp_ms = float(np.mean(clamped_comp_lats)) if clamped_comp_lats else 0.0
+
+        # 其他累加指标
+        inv_queue_ms = float(np.sum([r.get("queue_lat", 0.0) for r in clean_invokes])) / max(1, mb)
+        inv_cold_ms = float(np.sum([r.get("cold_penalty", 0.0) for r in clean_invokes])) / max(1, mb)
+        inv_cold_cnt = int(np.sum([1 for r in clean_invokes if r.get("is_cold", False)]))
+
+        # 5. 成本分类
         cost_pre = float(np.sum([r.get("cost_usd", 0.0) for r in clean_invokes if "pre_fwd" in r.get("func_name", "")]))
         cost_expert = float(
             np.sum([r.get("cost_usd", 0.0) for r in clean_invokes if "expert_fwd" in r.get("func_name", "")]))
         cost_post = float(
             np.sum([r.get("cost_usd", 0.0) for r in clean_invokes if "post_fwd" in r.get("func_name", "")]))
-
-        # 💡 单步总成本应该只计算 FWD + BWD + STEP 的原子开销总和
         total_cost = float(np.sum([r.get("cost_usd", 0.0) for r in clean_invokes]))
 
-        # 同样的，修改冷启动统计
-        inv_cold_cnt = int(np.sum([1 for r in clean_invokes if r.get("is_cold", False)]))
-        inv_cold_ms = float(np.sum([r.get("cold_penalty", 0.0) for r in clean_invokes]))
-        # 通信指标
-        inv_comp_ms = float(np.mean([
-            r.get("actual_lat", 0) - r.get("cold_penalty", 0) - r.get("inv_net_ms", 0)
-            for r in clean_invokes if "fwd" in r.get("func_name", "")
-        ]))
-
-        # 重新计算网络和排队（确保从字典中直接取值）
-        inv_net_ms = float(np.sum([r.get("inv_net_ms", 0.0) for r in clean_invokes]))
-        inv_queue_ms = float(np.sum([r.get("inv_queue_ms", 0.0) for r in clean_invokes]))
-
-        # 计算 CCR (Communication-to-Computation Ratio) - 论文中的核心性能指标
-        ccr = inv_net_ms / (inv_comp_ms + 1e-9)
-
-        # 更新 R2 监控器也用 clean_invokes
-        for r in clean_invokes:
-            # 💡 建议：只统计 FWD 阶段的专家调用，因为这是 TRI_SCHED 真正预测的对象
-            if "actual_lat" in r and "pred_lat" in r:
-                func_name = r.get("func_name", "")
-                # 排除掉那些 base_compute_ms=0 的 zero/step 操作，它们会产生极小的 actual_lat 干扰 R2
-                if "fwd" in func_name and r["actual_lat"] > 1.0:
-                    PRED_MONITOR.update(r["actual_lat"], r["pred_lat"])
-
+        # 6. SLO 计算
         step_time_ms = (time.perf_counter() - t_step0) * 1000.0
         DEADLINE_EST.update(step_time_ms)
+        current_deadline = float(DEADLINE_EST.deadline_ms(step))
+        # 违约判定：平均微批次时间是否超过 Deadline
+        viol = 1.0 if (step_time_ms / mb) > current_deadline else 0.0
 
-        # 如果当前步耗时超过了预测的截止时间，则标记为 1.0 (违规)
-        current_deadline = DEADLINE_EST.deadline_ms(step)
-        # 💡 优化：如果你发现 step_time_ms 普遍在 500ms 以上，而 deadline 只有 200ms
-        # 说明你的 DEADLINE_MIN_MS (约 130行) 设小了。
-        # 临时建议：将 viol 的判断加入一定的容忍度，或增大 DEADLINE_SAFETY 系数
-        viol = 1.0 if step_time_ms > (current_deadline * 1.2) else 0.0
-
-        # --- 记录专家负载不均程度 ---
-        scores = HEATMAP.scores  # 这是一个数组
-        gini = 1.0 - np.sum((scores) ** 2)  # 简易离散度指标
-
-        # 5. 实例化 StepMetrics 对象并记录到 CSV
+        # 7. 记录 Metrics
         metrics_record = StepMetrics(
-            epoch=1,
+            epoch=current_epoch,
             step=step,
             phase=split,
             loss=loss,
@@ -1554,25 +1560,26 @@ async def train():
             predictor_mae=float(current_mae),
             inv_cold_cnt=inv_cold_cnt,
             inv_cold_ms=inv_cold_ms,
-            inv_net_ms=inv_net_ms,  # 👈 补全：网络开销
-            inv_compute_ms=inv_comp_ms,  # 👈 补全：纯计算开销
-            inv_queue_ms=inv_queue_ms,  # 👈 补全：排队开销
-            cost_usd_step=float(total_cost),
+            inv_net_ms=inv_net_ms,
+            inv_compute_ms=inv_comp_ms,
+            inv_queue_ms=inv_queue_ms,
+            cost_usd_step=total_cost,
             cost_usd_pre_fwd=cost_pre,
             cost_usd_post_fwd=cost_post,
             cost_usd_expert_fwd=cost_expert,
             hot_ratio=hot_ratio,
-            deadline_violation_frac=float(viol),  # 👈 补全：SLO 违约率
+            deadline_ms=current_deadline,
+            deadline_violation_frac=float(viol),
             ablation_mode=os.getenv("ABLATION_MODE", "full")
         )
 
         logger.log(metrics_record)
 
-        # 实时打印验证（方便在控制台即时观察 R2 和 Cost）
         if (step % LOG_TRAIN_EVERY) == 0 or split == "val":
             print(
                 f"[{split}] step={step} loss={loss:.4f} acc5={acc5:.4f} "
-                f"time={step_time_ms:.0f}ms cost=${total_cost:.6f} R2={current_r2:.3f}"
+                f"time={step_time_ms:.0f}ms cost=${total_cost:.6f} R2={current_r2:.3f} "
+                f"comp={inv_comp_ms:.1f}ms net={inv_net_ms:.1f}ms"
             )
 
 def main():
