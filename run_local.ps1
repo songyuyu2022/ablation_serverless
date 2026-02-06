@@ -38,8 +38,17 @@ $env:USE_HTTP_EXEC="0"
 $env:LOCAL_COMPUTE="1"
 
 # --------------------------------------------
-# Simulation Knobs
+# Simulation Knobs (关键参数修正区)
 # --------------------------------------------
+# 1. 网络延迟基准：设为 50ms，模拟跨地域延迟
+#    HeatMoE 优化后 (0.5x) => 25ms，显著区别于计算时间
+$env:DEFAULT_NET_LATENCY_MS="50.0"
+
+# 2. 真实 Trace 仿真开关：强制关闭
+#    确保使用我们设定的 base_compute_ms (约13ms)，避免 5000ms 的异常值
+$env:USE_TRACE_CALIB="0"
+
+# 其他热点参数
 $env:HOTSPOT_DRIFT_EVERY="50"
 $env:HOT_PROB="0.85"
 $env:WARM_PROB="0.10"
@@ -53,12 +62,12 @@ $env:EVICTION_TAU_MS="20000"
 Write-Host "================================================"
 Write-Host "    Serverless MoE Local Simulation (No-GUI)    "
 Write-Host "    Mode: LocalExecutor (In-Process)            "
-Write-Host "    Storage: File-based CommManager (comm_sim)  "
+Write-Host "    Config: Net=50ms, Trace=OFF                 "
 Write-Host "================================================"
-Write-Host " [1] Run Ours (My Method)"
-Write-Host " [2] Run Ablation Variants (Static, No-NSGA, etc.)"
-Write-Host " [3] Run Baseline Comparisons (RR, Greedy, Random)"
-Write-Host " [4] Run ALL Experiments"
+Write-Host " [1] Run Ours (HeatMoE Full)"
+Write-Host " [2] Run Ablation (No-NSGA, No-HotCold, etc.)"
+Write-Host " [3] Run Baselines (Random, Round Robin)"
+Write-Host " [4] Run ALL Experiments (Paper Full Set)"
 Write-Host "================================================"
 
 $choice = Read-Host "Enter your choice (1-4)"
@@ -73,9 +82,6 @@ function Cleanup-Data {
 
     # 2. [可选] 清理 Python 缓存 (推荐清理，防止代码修改不生效)
     Get-ChildItem -Path . -Recurse -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-    # 3. [可选] 清理词表缓存 (仅在修改 input.txt 后需要打开)
-    # if (Test-Path "vocab.json") { Remove-Item "vocab.json" }
 
     # 等待文件锁释放
     Start-Sleep -Milliseconds 200
@@ -112,21 +118,26 @@ function Run-Controller {
 switch ($choice) {
     "1" { Run-Controller -etype "ablation" -mode "full" }
     "2" {
-        $modes = @("static_compute", "no_nsga", "no_online")
+        # 已移除 static_compute，只保留有意义的消融实验
+        $modes = @("no_nsga", "no_online", "no_hotcold")
         foreach ($m in $modes) { Run-Controller -etype "ablation" -mode $m }
     }
     "3" {
-        $modes = @("round_robin","greedy","random")
+        # 已移除 greedy，只保留核心对比基线
+        $modes = @("round_robin", "random")
         foreach ($m in $modes) { Run-Controller -etype "baseline" -mode $m }
     }
     "4" {
-        # Ours
+        # 自动跑全套论文数据
+        # 1. Ours
         Run-Controller -etype "ablation" -mode "full"
-        # Baselines
-        $bl = @("round_robin","greedy","random")
+
+        # 2. Baselines (对比组)
+        $bl = @("round_robin", "random")
         foreach ($m in $bl) { Run-Controller -etype "baseline" -mode $m }
-        # Ablations
-        $ab = @("static_compute", "no_nsga", "no_online")
+
+        # 3. Ablations (消融组)
+        $ab = @("no_hotcold", "no_nsga", "no_online")
         foreach ($m in $ab) { Run-Controller -etype "ablation" -mode $m }
     }
     Default { Write-Host "Invalid selection." }

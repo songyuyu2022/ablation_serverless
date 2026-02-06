@@ -117,7 +117,7 @@ ABLATION_MODE = os.getenv("ABLATION_MODE", "full")
 BASELINE_MODE = os.getenv("BASELINE_MODE", "round_robin")
 
 # Training
-MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "200"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 MICRO_BATCH = int(os.getenv("MICRO_BATCH", "4"))
 LOG_TRAIN_EVERY = int(os.getenv("LOG_TRAIN_EVERY", "20"))
@@ -147,7 +147,7 @@ WARM_PROB = float(os.getenv("WARM_PROB", "0.15"))
 TRAFFIC_SKEW_ENABLE = os.getenv("TRAFFIC_SKEW_ENABLE", "1") == "1"
 
 # Network multipliers
-DEFAULT_NET_LATENCY = float(os.getenv("DEFAULT_NET_LATENCY_MS", "5.0"))
+DEFAULT_NET_LATENCY = float(os.getenv("DEFAULT_NET_LATENCY_MS", "50.0"))
 DEFAULT_PERFORMANCE = float(os.getenv("DEFAULT_PERFORMANCE", "1.0"))
 HOT_NET_MUL = float(os.getenv("HOT_NET_MUL", "0.5"))
 COLD_NET_MUL = float(os.getenv("COLD_NET_MUL", "2.0"))
@@ -201,12 +201,10 @@ VM_COLD_START_MS = float(os.getenv("VM_COLD_START_MS", "2000.0"))
 @dataclass
 class AblationConfig:
     is_baseline: bool = False
-    is_static_compute: bool = False
     disable_hotcold: bool = False
     force_sync_update: bool = False
     use_random_sched: bool = False
     use_rr_sched: bool = False
-    use_greedy_sched: bool = False
     use_bsp: bool = False
     use_ssp: bool = False
     use_asp: bool = False
@@ -222,8 +220,6 @@ class AblationConfig:
             m = BASELINE_MODE.lower()
             cfg.use_rr_sched = (m == "round_robin")
             cfg.use_random_sched = (m == "random")
-            cfg.is_static_compute = (m == "static")
-            cfg.use_greedy_sched = (m == "greedy")
             cfg.use_bsp = (m == "bsp")
             cfg.use_ssp = (m == "ssp")
             cfg.use_asp = (m == "asp")
@@ -233,14 +229,10 @@ class AblationConfig:
                 cfg.disable_hotcold = True
             elif m == "sync_update":
                 cfg.force_sync_update = True
-            elif m == "static_compute":
-                cfg.is_static_compute = True
             elif m == "random_sched":
                 cfg.use_random_sched = True
             elif m == "rr_sched":
                 cfg.use_rr_sched = True
-            elif m == "greedy_sched":
-                cfg.use_greedy_sched = True
             elif m == "no_nsga":
                 cfg.disable_nsga = True
             elif m == "no_online":
@@ -631,7 +623,6 @@ class InstanceManager:
         return 40.0 if is_local else 250.0
 
     async def cold_start_ms(self, inst: Dict[str, Any], *, func_name: str, mode: str) -> float:
-        if ABL_CFG.is_static_compute: return 0.0
         inst_id = str(inst.get("id", ""))
         is_vm_starting = AUTOSCALER.check_starting_status(inst_id)
         AUTOSCALER.touch(inst_id)
@@ -663,7 +654,8 @@ class InstanceManager:
 INSTANCE_MGR = InstanceManager()
 
 # Trace Calibrator (Azure/Alibaba)
-USE_TRACE_CALIB = os.getenv("USE_TRACE_CALIB", "1") == "1"
+USE_TRACE_CALIB = os.getenv("USE_TRACE_CALIB", "0") == "1"
+# USE_TRACE_CALIB = False
 AZURE_PROFILE_PATH = os.getenv("AZURE_PROFILE_PATH", os.path.join("tools", "calib", "azure2021_profile.json"))
 ALIBABA_GPU_PROFILE_PATH = os.getenv("ALIBABA_GPU_PROFILE_PATH",
                                      os.path.join("tools", "calib", "alibaba2025_gpu_profile.json"))
@@ -808,7 +800,6 @@ async def simulate_invoke_with_breakdown(
     region = str(inst.get("region", "local")).lower()
     is_local = "local" in region
     local_oom_prob = float(os.getenv("LOCAL_OOM_PROB", "0.05"))
-    if ABL_CFG.is_static_compute and is_local: local_oom_prob = 0.0
     if is_local and local_oom_prob > 0 and random.random() < local_oom_prob:
         raise RuntimeError(f"Simulated Local Busy/OOM for {inst.get('id')}")
     meta = inst.get("meta", {}) or {}
@@ -878,14 +869,6 @@ class BaselineScheduler:
         self.rr_ptr[func_name] = p + 1
         return inst_list[p]
 
-    def select_greedy_min_rtt(self, inst_list):
-        best, best_v = None, 1e18
-        for x in inst_list:
-            meta = x.get("meta", {}) or {}
-            rtt = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY)))
-            if rtt < best_v: best_v, best = rtt, x
-        return best if best is not None else random.choice(inst_list)
-
 
 BASELINE_SCHED = BaselineScheduler()
 
@@ -944,7 +927,7 @@ def _predict_static_total_ms_and_cost(inst, *, func_name, mode, base_compute_ms)
     net_base = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY)))
     net_ms = net_base * _mode_net_multiplier(mode)
     if (mode or "").lower() == "cold": net_ms += float(COLD_STORAGE_MS)
-    cold_ms = INSTANCE_MGR._default_cold_start_ms(func_name, inst) if not ABL_CFG.is_static_compute else 0.0
+    cold_ms = INSTANCE_MGR._default_cold_start_ms(func_name, inst)
     queue_ms = 0.0
     tot_ms = float(queue_ms + cold_ms + net_ms + compute_ms)
     cost = _cost_usd(inst, tot_ms)
@@ -1068,10 +1051,6 @@ async def invoke_with_retry(func_name, logical_id, candidates, req, base_compute
             forced_inst = BASELINE_SCHED.select_random(candidates)
         elif ABL_CFG.use_rr_sched:
             forced_inst = BASELINE_SCHED.select_rr(func_name, candidates)
-        elif ABL_CFG.use_greedy_sched:
-            forced_inst = BASELINE_SCHED.select_greedy_min_rtt(candidates)
-        elif ABL_CFG.is_static_compute:
-            forced_inst = candidates[0]
 
     tries, last_err = 0, None
 
