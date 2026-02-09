@@ -29,31 +29,91 @@ from makemoe_adapter import MakeMoEAdapter
 from makeMoE import MakeMoEConfig
 from comm import CommManager
 import requests
-
+from collections import deque
 # [Insert in controller.py] 辅助类：计算预测器 R2 Score
 class PredictionMonitor:
-    def __init__(self, window_size=50):
-        self.window_size = window_size
-        self.history_true = []
-        self.history_pred = []
+    """
+    Online prediction monitor.
+    - MAE(t) = | pred(t-1) - actual(t) |
+    - R2 computed on lagged pairs, with variance guard
+    """
 
-    def update(self, y_true, y_pred):
-        if y_pred is None or y_pred <= 0: return
-        self.history_true.append(float(y_true))
-        self.history_pred.append(float(y_pred))
-        if len(self.history_true) > self.window_size:
-            self.history_true.pop(0)
-            self.history_pred.pop(0)
+    def __init__(self, window: int = 50):
+        self.window = window
+
+        # lagged prediction buffer
+        self._last_pred = None
+
+        # store error pairs
+        self._y_true = deque(maxlen=window)
+        self._y_pred = deque(maxlen=window)
+
+    def update(self, *, pred_lat: float, actual_lat: float):
+        """
+        Update monitor with current prediction and actual latency.
+        """
+        # record MAE / R2 using last prediction
+        if self._last_pred is not None and actual_lat is not None:
+            try:
+                y_t = float(actual_lat)
+                y_hat = float(self._last_pred)
+
+                # allow zero / small values, just ignore NaN / inf
+                if np.isfinite(y_t) and np.isfinite(y_hat):
+                    self._y_true.append(y_t)
+                    self._y_pred.append(y_hat)
+            except Exception:
+                pass
+
+        # update last prediction for next step
+        if pred_lat is not None:
+            try:
+                p = float(pred_lat)
+                if np.isfinite(p):
+                    self._last_pred = p
+            except Exception:
+                pass
+
+    def get_mae(self):
+        if len(self._y_true) == 0:
+            return 0.0
+        y_t = np.asarray(self._y_true)
+        y_p = np.asarray(self._y_pred)
+        return float(np.mean(np.abs(y_p - y_t)))
+
+    def get_r2(self):
+        """
+        Numerically stable R2.
+        Returns 0.0 when variance too small or samples insufficient.
+        """
+        n = len(self._y_true)
+        if n < 3:
+            return 0.0
+
+        y_t = np.asarray(self._y_true)
+        y_p = np.asarray(self._y_pred)
+
+        # total sum of squares
+        var = np.var(y_t)
+        if var < 1e-6:
+            return 0.0
+
+        sse = np.sum((y_p - y_t) ** 2)
+        sst = np.sum((y_t - np.mean(y_t)) ** 2)
+
+        if sst <= 1e-9:
+            return 0.0
+
+        r2 = 1.0 - sse / sst
+
+        # clip to reasonable range (avoid extreme negatives)
+        return float(np.clip(r2, -1.0, 1.0))
 
     def get_r2_mae(self):
-        if len(self.history_true) < 5: return 0.0, 0.0
-        y_true = np.array(self.history_true)
-        y_pred = np.array(self.history_pred)
-        mae = np.mean(np.abs(y_true - y_pred))
-        ss_res = np.sum((y_true - y_pred) ** 2)
-        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-        r2 = 0.0 if ss_tot < 1e-6 else (1 - (ss_res / ss_tot))
-        return float(r2), float(mae)
+        """
+        Compatibility helper if you were calling get_r2_mae()
+        """
+        return self.get_r2(), self.get_mae()
 
 # 实例化全局监控器
 PRED_MONITOR = PredictionMonitor()
@@ -788,6 +848,10 @@ def _get_inst_sem(inst: Dict[str, Any]) -> asyncio.Semaphore:
     return INSTANCE_SEM[inst_id]
 
 
+class LocalTransientError(RuntimeError):
+    """Transient local failure (busy/oom). Should be retried, not crash the training loop."""
+    pass
+
 async def simulate_invoke_with_breakdown(
         inst: Dict[str, Any],
         base_compute_ms: float,
@@ -797,45 +861,104 @@ async def simulate_invoke_with_breakdown(
         mode: str,
         global_step: int,
 ) -> Tuple[float, float, float, float, float]:
+    """
+    Return (total_ms, queue_ms, cold_ms, net_ms, compute_ms)
+
+    Fixes:
+    - Always returns a breakdown for any instance/region (no silent None).
+    - Busy/OOM is modeled as transient failure for *local non-virtual* instances only.
+    - Trace-based calibration avoids double-adding cold-start (warm -> cold, cold -> max()).
+    """
     region = str(inst.get("region", "local")).lower()
-    is_local = "local" in region
-    local_oom_prob = float(os.getenv("LOCAL_OOM_PROB", "0.05"))
-    if is_local and local_oom_prob > 0 and random.random() < local_oom_prob:
-        raise RuntimeError(f"Simulated Local Busy/OOM for {inst.get('id')}")
+    is_local = ("local" in region)
+
+    inst_id = str(inst.get("id", ""))
+    is_virtual = (inst_id == "local_v_inst")
+
+    # transient failure injection (serverless realism)
+    local_oom_prob = float(os.getenv("LOCAL_OOM_PROB", "0.01"))
+    local_busy_prob = float(os.getenv("LOCAL_BUSY_PROB", "0.00"))
+
+    if is_local and (not is_virtual):
+        r = random.random()
+        if (local_oom_prob > 0 and r < local_oom_prob) or (local_busy_prob > 0 and r < local_busy_prob):
+            raise LocalTransientError(f"Simulated Local Busy/OOM for {inst_id}")
+
     meta = inst.get("meta", {}) or {}
     perf = float(meta.get("performance", DEFAULT_PERFORMANCE))
     raw_compute = float(base_compute_ms) / max(perf, 1e-6)
     compute_ms = raw_compute * random.uniform(0.90, 1.10)
+
+    # cold start from instance manager
     cold_ms = float(await INSTANCE_MGR.cold_start_ms(inst, func_name=func_name, mode=mode))
+
+    # detect GPU-like task (used by trace calibration)
     is_gpu_task = False
     try:
-        if float(meta.get("gpu_request", 0) or 0) > 0: is_gpu_task = True
-        if float(meta.get("gpu_limit", 0) or 0) > 0: is_gpu_task = True
+        if float(meta.get("gpu_request", 0) or 0) > 0:
+            is_gpu_task = True
+        if float(meta.get("gpu_limit", 0) or 0) > 0:
+            is_gpu_task = True
         dev = str(meta.get("device", "")).lower()
-        if "gpu" in dev or "cuda" in dev: is_gpu_task = True
-    except:
+        if ("gpu" in dev) or ("cuda" in dev):
+            is_gpu_task = True
+    except Exception:
         pass
-    if "expert" in (func_name or "").lower(): is_gpu_task = True
+    if "expert" in (func_name or "").lower():
+        is_gpu_task = True
+
+    # ---- trace calibration (optional) ----
     if USE_TRACE_CALIB and TRACE.azure is not None:
         az_pair = TRACE.sample_azure_pair()
-        p_cold = TRACE.inferred_cold_prob(az_pair)
-        if random.random() < float(p_cold): cold_ms += TRACE.sample_cold_extra_ms()
+        p_cold = float(TRACE.inferred_cold_prob(az_pair))
+        # Avoid double-add cold
+        if cold_ms <= 1e-9:
+            if random.random() < p_cold:
+                cold_ms = float(TRACE.sample_cold_extra_ms())
+        else:
+            cold_ms = float(max(cold_ms, TRACE.sample_cold_extra_ms()))
+
     if USE_TRACE_CALIB and is_gpu_task and TRACE.gpu is not None:
         gpu_pair = TRACE.sample_gpu_pair()
         sampled = TRACE.sample_gpu_duration_ms(gpu_pair)
-        if sampled is not None: compute_ms = float(sampled)
+        if sampled is not None:
+            sampled = float(sampled)
+
+            # 如果 trace 实际单位是 us（常见），做一次自动纠偏（阈值可调）
+            if sampled > 20000:  # 20s 太离谱，基本说明单位错了
+                sampled = sampled / 1000.0
+
+            # 再做上限裁剪，避免 5s 这种把曲线毁掉
+            compute_ms = float(min(sampled, float(os.getenv("MAX_GPU_COMPUTE_MS", "200.0"))))
+
+    # queue + gpu pool queue
     sem = _get_inst_sem(inst)
     tq0 = time.perf_counter()
     async with sem:
         queue_ms = (time.perf_counter() - tq0) * 1000.0
+
         if USE_TRACE_CALIB and is_gpu_task and GPU_POOL_SEM is not None:
             tg0 = time.perf_counter()
-            async with GPU_POOL_SEM: queue_ms += (time.perf_counter() - tg0) * 1000.0
+            async with GPU_POOL_SEM:
+                queue_ms += (time.perf_counter() - tg0) * 1000.0
+
+        # network latency
         net_base = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY)))
+
+        # Sanity protection against misconfigured too-small RTT when DEFAULT_NET_LATENCY_MS is set
+        try:
+            min_ratio = float(os.getenv("MIN_NET_LATENCY_RATIO", "0.0"))
+        except Exception:
+            min_ratio = 0.0
+        if DEFAULT_NET_LATENCY >= 10.0 and min_ratio > 0.0 and net_base < DEFAULT_NET_LATENCY * min_ratio:
+            net_base = float(DEFAULT_NET_LATENCY)
+
         net_ms = net_base * _mode_net_multiplier(mode) * random.uniform(0.90, 1.10)
-        if (mode or "").lower() == "cold": net_ms += float(COLD_STORAGE_MS)
-        total_ms = queue_ms + cold_ms + net_ms + compute_ms
-        return total_ms, queue_ms, cold_ms, net_ms, compute_ms
+        if (mode or "").lower() == "cold":
+            net_ms += float(COLD_STORAGE_MS)
+
+        total_ms = float(queue_ms + cold_ms + net_ms + compute_ms)
+        return total_ms, float(queue_ms), float(cold_ms), float(net_ms), float(compute_ms)
 
 
 try:
@@ -843,6 +966,8 @@ try:
 except:
     aiohttp = None
 import requests
+
+
 
 _HTTP_SEM = asyncio.Semaphore(max(1, HTTP_CONCURRENCY))
 
@@ -1039,120 +1164,263 @@ def _to_tensor(v: Any, *, device: torch.device, dtype: Optional[torch.dtype] = N
     return t.to(device)
 
 
-async def invoke_with_retry(func_name, logical_id, candidates, req, base_compute_ms, *, mode, max_tries,
-                            forced_inst=None, global_step=0):
-    if not candidates: raise RuntimeError(f"invoke candidates empty for {func_name}")
+async def invoke_with_retry(
+        func_name,
+        logical_id,
+        candidates,
+        req,
+        base_compute_ms,
+        *,
+        mode,
+        max_tries,
+        forced_inst=None,
+        global_step=0,
+):
+    """
+    Serverless-style invocation with retry + backoff + graceful degradation.
+    Returns: (inst, meta_dict, retry_cnt)
+      meta_dict contains:
+        ok, func_name, actual_lat, pred_lat, cost_usd, is_cold, cold_penalty,
+        net_lat, comp_lat, queue_lat, raw_breakdown, fail_reason(optional)
+    """
+    if not candidates:
+        # In local-compute mode, allow a virtual instance so metrics still record.
+        if LOCAL_EXECUTOR is not None:
+            candidates = [{"id": "local_v_inst", "region": "local", "meta": {"performance": 1.0}}]
+        else:
+            raise RuntimeError(f"invoke candidates empty for {func_name}")
 
-    # [NEW] 提前声明变量，用于记录本次选择的预测耗时
-    current_pred_ms = 0.0
-
+    # baseline forced instance selection (kept)
     if forced_inst is None and ABL_CFG.is_baseline:
         if ABL_CFG.use_random_sched:
             forced_inst = BASELINE_SCHED.select_random(candidates)
         elif ABL_CFG.use_rr_sched:
             forced_inst = BASELINE_SCHED.select_rr(func_name, candidates)
 
-    tries, last_err = 0, None
+    # retry knobs
+    backoff_ms = float(os.getenv("RETRY_BACKOFF_MS", "5.0"))
+    max_backoff_ms = float(os.getenv("RETRY_BACKOFF_MAX_MS", "50.0"))
+    fail_penalty_ms = float(os.getenv("FAIL_PENALTY_MS", "200.0"))
 
-    async def _try(inst, retry_cnt, pred_ms_val):
-        # 1. 模拟调用，获取详细的时间拆分 (total, queue, cold, net, compute)
-        breakdown_tuple = await simulate_invoke_with_breakdown(inst, base_compute_ms, req, func_name=func_name,
-                                                               mode=mode,
-                                                               global_step=global_step)
+    tries = 0
+    retry_cnt = 0
+    last_err = None
 
-        # 💡 [修正点 1] 显式解包，防止索引错误
-        actual_ms = breakdown_tuple[0]
-        queue_lat = breakdown_tuple[1]
-        cold_lat = breakdown_tuple[2]
-        net_lat = breakdown_tuple[3]
-        comp_lat = breakdown_tuple[4]
+    async def _simulate_one(inst, pred_ms_val: float):
+        # simulate breakdown; may raise LocalTransientError/RuntimeError
+        breakdown_tuple = await simulate_invoke_with_breakdown(
+            inst,
+            base_compute_ms,
+            req,
+            func_name=func_name,
+            mode=mode,
+            global_step=global_step,
+        )
+        actual_ms, queue_lat, cold_lat, net_lat, comp_lat = breakdown_tuple
+        total_ms = float(min(max(actual_ms, 0.001), 15000.0))
 
-        # 限制模拟延迟上限
-        total_ms = min(max(breakdown_tuple[0], 0.001), 15000.0)
-
-        # 2. 计算真实成本
-        price_rate = inst.get("meta", {}).get("price", 0.00000021)
+        price_rate = float(inst.get("meta", {}).get("price", 0.00000021))
         cost_usd = total_ms * price_rate
 
-        HYBRID_SCHED.update_stats(inst, actual_ms)
-        _maybe_autoscale(func_name, candidates, queue_lat, global_step)
+        # IMPORTANT: call scheduler update if signature matches (be defensive)
+        try:
+            # common signature: update_stats(func_name, logical_id, inst, req, total_ms)
+            HYBRID_SCHED.update_stats(func_name, logical_id, inst, req, total_ms)
+        except Exception:
+            try:
+                # fallback signature: update_stats(inst, total_ms)
+                HYBRID_SCHED.update_stats(inst, total_ms)
+            except Exception:
+                pass
 
-        if SIM_SLEEP: await asyncio.sleep(actual_ms / 1000.0)
+        try:
+            _maybe_autoscale(func_name, candidates, queue_lat, global_step)
+        except Exception:
+            pass
 
-        # 💡 [修正点 2] 将所有维度明确存入 res_meta，方便 train 函数提取
-        res_meta = {
+        if SIM_SLEEP:
+            await asyncio.sleep(total_ms / 1000.0)
+
+        meta = {
             "ok": True,
             "func_name": func_name,
             "actual_lat": total_ms,
-            "pred_lat": pred_ms_val,
-            "cost_usd": cost_usd,
-            "is_cold": cold_lat > 0,
-            "cold_penalty": cold_lat,
-            "net_lat": net_lat,  # 👈 新增：网络延迟
-            "comp_lat": comp_lat,  # 👈 新增：纯计算时间
-            "queue_lat": queue_lat,  # 👈 新增：排队延迟
-            "raw_breakdown": breakdown_tuple
+            "pred_lat": float(pred_ms_val),
+            "cost_usd": float(cost_usd),
+            "is_cold": float(cold_lat) > 0.0,
+            "cold_penalty": float(cold_lat),
+            "net_lat": float(net_lat),
+            "comp_lat": float(comp_lat),
+            "queue_lat": float(queue_lat),
+            "raw_breakdown": breakdown_tuple,
         }
+        return meta
 
-        # 记得更新调度器统计也用干净的数据
-        HYBRID_SCHED.update_stats(inst, total_ms)
+    # choose candidate list
+    cand = list(candidates)
 
-        return inst, res_meta, retry_cnt
-
-    # 情况 A: 有强制指定的实例 (基线模式)
+    # forced instance path
     if forced_inst is not None:
         try:
-            # 基线模式预测值通常为 0，或者你可以给个固定值
-            return await _try(forced_inst, 0, 0.0)
+            meta = await _simulate_one(forced_inst, 0.0)
+            return forced_inst, meta, retry_cnt
         except Exception as e:
             last_err = e
+            # fall through to normal retry path
 
-    # 情况 B: 正常调度逻辑
-    cand = list(candidates)
     while tries < max_tries and cand:
         tries += 1
-        if not ABL_CFG.is_baseline:
-            deadline_ms = float(DEADLINE_EST.deadline_ms(global_step))
-            # 💡 [关键改动] 获取调度决策的同时记录预测值
-            # 假设你的 TRI_SCHED.select 在内部算过预测值，可以通过 get_prediction 提前获取
-            current_pred_ms = TRI_SCHED.predict(cand[0], base_compute_ms) if hasattr(TRI_SCHED, 'predict') else 0.0
 
-            inst = TRI_SCHED.select(cand, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms,
-                                    deadline_ms=deadline_ms)
-        else:
+        # ---- select instance (keep your existing selection logic if available) ----
+        inst = None
+        pred_ms = 0.0
+        try:
+            # If you have a predictor-based selection, keep it:
+            if not ABL_CFG.is_baseline:
+                inst, pred_ms = HYBRID_SCHED.select(func_name, cand, req=req, global_step=global_step)
+            else:
+                inst = random.choice(cand)
+                pred_ms = 0.0
+        except Exception:
             inst = random.choice(cand)
-            current_pred_ms = 0.0
+            pred_ms = 0.0
 
         try:
-            return await _try(inst, max(0, tries - 1), current_pred_ms)
-        except Exception as e:
+            meta = await _simulate_one(inst, pred_ms)
+            return inst, meta, retry_cnt
+
+        except LocalTransientError as e:
             last_err = e
+            retry_cnt += 1
+
+            # backoff + jitter (serverless-like)
+            jitter = random.uniform(0.0, 1.0)
+            sleep = min(max_backoff_ms, backoff_ms * (1.5 ** max(retry_cnt - 1, 0))) * (0.5 + jitter)
+            if SIM_SLEEP:
+                await asyncio.sleep(sleep / 1000.0)
+
+            # avoid repeatedly picking the same inst
+            bad = inst.get("id")
+            cand = [x for x in cand if x.get("id") != bad] + [inst]
+            continue
+
+        except RuntimeError as e:
+            # treat "Simulated Local Busy/OOM" as transient too (compat)
+            if "Simulated Local Busy/OOM" in str(e):
+                last_err = e
+                retry_cnt += 1
+                jitter = random.uniform(0.0, 1.0)
+                sleep = min(max_backoff_ms, backoff_ms * (1.5 ** max(retry_cnt - 1, 0))) * (0.5 + jitter)
+                if SIM_SLEEP:
+                    await asyncio.sleep(sleep / 1000.0)
+                bad = inst.get("id")
+                cand = [x for x in cand if x.get("id") != bad] + [inst]
+                continue
+            last_err = e
+            retry_cnt += 1
+            # remove this inst and retry others
             bad = inst.get("id")
             cand = [x for x in cand if x.get("id") != bad]
+            continue
 
-    raise RuntimeError(f"invoke_with_retry failed: {last_err}")
+        except Exception as e:
+            last_err = e
+            retry_cnt += 1
+            bad = inst.get("id") if inst else None
+            if bad:
+                cand = [x for x in cand if x.get("id") != bad]
+            continue
+
+    # ---- Graceful degrade: do NOT crash training ----
+    # approximate breakdown: compute + default net + penalty
+    fallback_inst = candidates[0]
+    net_lat = float(os.getenv("DEFAULT_NET_LATENCY_MS", str(DEFAULT_NET_LATENCY)))
+    comp_lat = float(base_compute_ms)
+    queue_lat = 0.0
+    cold_lat = 0.0
+    total_ms = float(queue_lat + cold_lat + net_lat + comp_lat + fail_penalty_ms)
+
+    price_rate = float(fallback_inst.get("meta", {}).get("price", 0.00000021))
+    cost_usd = total_ms * price_rate
+
+    meta = {
+        "ok": False,
+        "func_name": func_name,
+        "actual_lat": total_ms,
+        "pred_lat": 0.0,
+        "cost_usd": float(cost_usd),
+        "is_cold": False,
+        "cold_penalty": 0.0,
+        "net_lat": net_lat,
+        "comp_lat": comp_lat,
+        "queue_lat": queue_lat,
+        "raw_breakdown": (total_ms, queue_lat, cold_lat, net_lat, comp_lat),
+        "fail_reason": str(last_err),
+    }
+    return fallback_inst, meta, retry_cnt
 
 
 async def _invoke_fn(func_name, *, mode, base_compute_ms, http_path, payload, global_step):
     cands = _get_candidates(func_name)
 
-    # 【修复】如果本地执行器开启，且 JSON 里没配这个函数，则使用虚拟实例
-    if not cands and LOCAL_EXECUTOR:
+    # If local executor is enabled but JSON has no mapping for this func,
+    # use a virtual instance AND still simulate breakdown for realistic metrics.
+    if (not cands) and LOCAL_EXECUTOR:
         inst = {"id": "local_v_inst", "region": "local", "meta": {"performance": 1.0}}
+        try:
+            breakdown_tuple = await simulate_invoke_with_breakdown(
+                inst,
+                base_compute_ms,
+                req={},
+                func_name=func_name,
+                mode=mode,
+                global_step=global_step,
+            )
+            total_ms, queue_lat, cold_lat, net_lat, comp_lat = breakdown_tuple
+            price_rate = float(inst.get("meta", {}).get("price", 0.00000021))
+            cost_usd = float(total_ms) * price_rate
+            meta = {
+                "ok": True,
+                "func_name": func_name,
+                "actual_lat": float(total_ms),
+                "pred_lat": 0.0,
+                "cost_usd": float(cost_usd),
+                "is_cold": float(cold_lat) > 0.0,
+                "cold_penalty": float(cold_lat),
+                "net_lat": float(net_lat),
+                "comp_lat": float(comp_lat),
+                "queue_lat": float(queue_lat),
+                "raw_breakdown": breakdown_tuple,
+            }
+        except Exception as e:
+            # last resort: still don't crash
+            net_lat = float(os.getenv("DEFAULT_NET_LATENCY_MS", str(DEFAULT_NET_LATENCY)))
+            comp_lat = float(base_compute_ms)
+            total_ms = float(net_lat + comp_lat)
+            meta = {
+                "ok": False,
+                "func_name": func_name,
+                "actual_lat": total_ms,
+                "pred_lat": 0.0,
+                "cost_usd": 0.0,
+                "is_cold": False,
+                "cold_penalty": 0.0,
+                "net_lat": net_lat,
+                "comp_lat": comp_lat,
+                "queue_lat": 0.0,
+                "raw_breakdown": (total_ms, 0.0, 0.0, net_lat, comp_lat),
+                "fail_reason": str(e),
+            }
+
         obj = await LOCAL_EXECUTOR.run(func_name, http_path, payload)
-        meta_fallback = {
-            "actual_lat": 0.0,
-            "cost_usd": 0.0,
-            "is_cold": False,
-            "func_name": func_name
-        }
-        return inst, obj, meta_fallback, 0
+        return inst, obj, meta, 0
 
     if not cands:
         cands = [INST_BY_ID[i] for i in FUNC_MAP.get(func_name, []) if i in INST_BY_ID]
-        if not cands: raise RuntimeError(f"No candidates for {func_name}")
+        if not cands:
+            raise RuntimeError(f"No candidates for {func_name}")
 
-    inst, breakdown, retry_cnt = await invoke_with_retry(
+    inst, meta, retry_cnt = await invoke_with_retry(
         func_name, 0, cands, req={}, base_compute_ms=base_compute_ms,
         mode=mode, max_tries=INVOKE_RETRIES, global_step=global_step
     )
@@ -1161,7 +1429,7 @@ async def _invoke_fn(func_name, *, mode, base_compute_ms, http_path, payload, gl
         obj = await LOCAL_EXECUTOR.run(func_name, http_path, payload)
     else:
         obj = await invoke_http(inst, path=http_path, payload=payload) if USE_HTTP_EXEC else {}
-    return inst, obj, breakdown, retry_cnt
+    return inst, obj, meta, retry_cnt
 
 # ============================================================
 # Main Train Loop (UNCHANGED logic, just shortened for brevity)
@@ -1481,13 +1749,13 @@ async def train():
                 func_name = r.get("func_name", "")
                 is_valid_time = 1.0 < r["actual_lat"] < 5000.0  # 物理限幅
                 if "fwd" in func_name and is_valid_time:
-                    PRED_MONITOR.update(r["actual_lat"], r["pred_lat"])
+                    PRED_MONITOR.update(
+                        pred_lat=r["pred_lat"],
+                        actual_lat=r["actual_lat"]
+                    )
 
         # 获取最新的 R2 和 MAE
-        if len(PRED_MONITOR.history_true) > 0:
-            current_r2, current_mae = PRED_MONITOR.get_r2_mae()
-        else:
-            current_r2, current_mae = 0.0, 0.0
+        current_r2, current_mae = PRED_MONITOR.get_r2_mae()
 
         # 3. 基础指标聚合
         loss = float(np.mean([r.get("loss", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0

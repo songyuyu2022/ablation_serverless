@@ -4,11 +4,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.24,
-      "net_latency_ms": 5.4,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 201.6
+      "performance": 0.78,
+      "rtt_ms": 9.1,
+      "net_latency_ms": 9.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0016,
+      "cold_start_ms": 543.4
     }
   },
   {
@@ -16,23 +19,29 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 0.94,
-      "net_latency_ms": 2.9,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 50.0
+      "performance": 1.06,
+      "rtt_ms": 7.2,
+      "net_latency_ms": 7.2,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0021,
+      "cold_start_ms": 73.3
     }
   },
   {
     "id": "inst_pre_2",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.06,
-      "net_latency_ms": 2.9,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 1270.5
+      "performance": 0.88,
+      "rtt_ms": 76.1,
+      "net_latency_ms": 76.1,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0018,
+      "cold_start_ms": 917.0
     }
   },
   {
@@ -40,23 +49,29 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.16,
-      "net_latency_ms": 2.6,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 195.7
+      "performance": 0.51,
+      "rtt_ms": 6.1,
+      "net_latency_ms": 6.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.001,
+      "cold_start_ms": 173.6
     }
   },
   {
     "id": "inst_pre_4",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.04,
-      "net_latency_ms": 1.2,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 1690.3
+      "performance": 1.25,
+      "rtt_ms": 47.9,
+      "net_latency_ms": 47.9,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0026,
+      "cold_start_ms": 122.3
     }
   },
   {
@@ -64,11 +79,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 0.89,
-      "net_latency_ms": 3.1,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 405.6
+      "performance": 0.86,
+      "rtt_ms": 8.4,
+      "net_latency_ms": 8.4,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0017,
+      "cold_start_ms": 226.8
     }
   },
   {
@@ -76,11 +94,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 0.9,
-      "net_latency_ms": 6.3,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 180.9
+      "performance": 1.3,
+      "rtt_ms": 10.4,
+      "net_latency_ms": 10.4,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0026,
+      "cold_start_ms": 146.8
     }
   },
   {
@@ -88,11 +109,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.2,
-      "net_latency_ms": 5.1,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 273.8
+      "performance": 0.91,
+      "rtt_ms": 5.0,
+      "net_latency_ms": 5.0,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0018,
+      "cold_start_ms": 172.9
     }
   },
   {
@@ -100,11 +124,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.06,
-      "net_latency_ms": 2.4,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 359.2
+      "performance": 1.44,
+      "rtt_ms": 8.6,
+      "net_latency_ms": 8.6,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0029,
+      "cold_start_ms": 1407.3
     }
   },
   {
@@ -112,23 +139,29 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.11,
-      "net_latency_ms": 6.5,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 181.5
+      "performance": 1.2,
+      "rtt_ms": 6.4,
+      "net_latency_ms": 6.4,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0024,
+      "cold_start_ms": 333.3
     }
   },
   {
     "id": "inst_post_2",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.09,
-      "net_latency_ms": 4.1,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 345.3
+      "performance": 1.15,
+      "rtt_ms": 47.2,
+      "net_latency_ms": 47.2,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0024,
+      "cold_start_ms": 806.4
     }
   },
   {
@@ -136,11 +169,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 0.9,
-      "net_latency_ms": 0.6,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 64.3
+      "performance": 0.81,
+      "rtt_ms": 6.2,
+      "net_latency_ms": 6.2,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0016,
+      "cold_start_ms": 626.8
     }
   },
   {
@@ -148,11 +184,14 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.13,
-      "net_latency_ms": 7.2,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 598.8
+      "performance": 0.75,
+      "rtt_ms": 10.7,
+      "net_latency_ms": 10.7,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0015,
+      "cold_start_ms": 146.9
     }
   },
   {
@@ -160,35 +199,44 @@
     "region": "local",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 0.96,
-      "net_latency_ms": 6.8,
-      "price_cents_s": 0.002,
-      "cold_start_ms": 219.5
+      "performance": 1.18,
+      "rtt_ms": 3.1,
+      "net_latency_ms": 3.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0024,
+      "cold_start_ms": 78.0
     }
   },
   {
     "id": "inst_post_6",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.03,
-      "net_latency_ms": 4.7,
+      "performance": 0.97,
+      "rtt_ms": 37.5,
+      "net_latency_ms": 37.5,
+      "bandwidth_mbps": 2000,
       "price_cents_s": 0.002,
-      "cold_start_ms": 125.0
+      "cold_start_ms": 122.8
     }
   },
   {
     "id": "inst_post_7",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 2,
     "memory_mb": 4096,
+    "max_concurrency": 8,
     "meta": {
-      "performance": 1.19,
-      "net_latency_ms": 1.2,
+      "performance": 0.95,
+      "rtt_ms": 19.4,
+      "net_latency_ms": 19.4,
+      "bandwidth_mbps": 2000,
       "price_cents_s": 0.002,
-      "cold_start_ms": 566.9
+      "cold_start_ms": 50.0
     }
   },
   {
@@ -196,12 +244,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.57,
-      "net_latency_ms": 2.9,
-      "price_cents_s": 0.0157,
-      "cold_start_ms": 735.4
+      "performance": 1.25,
+      "rtt_ms": 2.6,
+      "net_latency_ms": 2.6,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0125,
+      "cold_start_ms": 449.3
     }
   },
   {
@@ -209,38 +260,47 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.97,
-      "net_latency_ms": 5.6,
-      "price_cents_s": 0.0097,
-      "cold_start_ms": 1455.2
+      "performance": 1.29,
+      "rtt_ms": 2.9,
+      "net_latency_ms": 2.9,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0129,
+      "cold_start_ms": 553.1
     }
   },
   {
     "id": "inst_exp0_rep2",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.73,
-      "net_latency_ms": 1.7,
+      "performance": 0.7,
+      "rtt_ms": 13.2,
+      "net_latency_ms": 13.2,
+      "bandwidth_mbps": 2000,
       "price_cents_s": 0.0073,
-      "cold_start_ms": 647.5
+      "cold_start_ms": 1255.1
     }
   },
   {
     "id": "inst_exp0_rep3",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.52,
-      "net_latency_ms": 4.4,
-      "price_cents_s": 0.0052,
-      "cold_start_ms": 271.5
+      "performance": 0.27,
+      "rtt_ms": 32.4,
+      "net_latency_ms": 32.4,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0028,
+      "cold_start_ms": 1023.9
     }
   },
   {
@@ -248,38 +308,47 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.51,
-      "net_latency_ms": 2.9,
-      "price_cents_s": 0.0151,
-      "cold_start_ms": 882.6
+      "performance": 1.44,
+      "rtt_ms": 3.6,
+      "net_latency_ms": 3.6,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0144,
+      "cold_start_ms": 125.8
     }
   },
   {
     "id": "inst_exp1_rep1",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.12,
-      "net_latency_ms": 3.5,
-      "price_cents_s": 0.0112,
-      "cold_start_ms": 200.0
+      "performance": 1.02,
+      "rtt_ms": 20.3,
+      "net_latency_ms": 20.3,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0107,
+      "cold_start_ms": 879.9
     }
   },
   {
     "id": "inst_exp1_rep2",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.69,
-      "net_latency_ms": 0.5,
-      "price_cents_s": 0.0069,
-      "cold_start_ms": 347.0
+      "performance": 0.77,
+      "rtt_ms": 78.6,
+      "net_latency_ms": 78.6,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0081,
+      "cold_start_ms": 546.6
     }
   },
   {
@@ -287,12 +356,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.46,
-      "net_latency_ms": 1.1,
-      "price_cents_s": 0.0046,
-      "cold_start_ms": 303.3
+      "performance": 0.93,
+      "rtt_ms": 3.0,
+      "net_latency_ms": 3.0,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0093,
+      "cold_start_ms": 880.7
     }
   },
   {
@@ -300,12 +372,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.49,
-      "net_latency_ms": 2.6,
-      "price_cents_s": 0.0149,
-      "cold_start_ms": 375.7
+      "performance": 1.8,
+      "rtt_ms": 2.1,
+      "net_latency_ms": 2.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.018,
+      "cold_start_ms": 3671.9
     }
   },
   {
@@ -313,64 +388,79 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.08,
-      "net_latency_ms": 6.0,
-      "price_cents_s": 0.0108,
-      "cold_start_ms": 2057.2
+      "performance": 0.84,
+      "rtt_ms": 6.4,
+      "net_latency_ms": 6.4,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0084,
+      "cold_start_ms": 227.3
     }
   },
   {
     "id": "inst_exp2_rep2",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.67,
-      "net_latency_ms": 11.4,
-      "price_cents_s": 0.0067,
-      "cold_start_ms": 610.8
+      "performance": 1.05,
+      "rtt_ms": 63.7,
+      "net_latency_ms": 63.7,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.011,
+      "cold_start_ms": 302.9
     }
   },
   {
     "id": "inst_exp2_rep3",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.47,
-      "net_latency_ms": 1.8,
-      "price_cents_s": 0.0047,
-      "cold_start_ms": 728.2
+      "performance": 0.46,
+      "rtt_ms": 36.7,
+      "net_latency_ms": 36.7,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0048,
+      "cold_start_ms": 1776.1
     }
   },
   {
     "id": "inst_exp3_rep0",
-    "region": "local",
+    "region": "far",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.33,
-      "net_latency_ms": 3.3,
-      "price_cents_s": 0.0133,
-      "cold_start_ms": 1291.6
+      "performance": 1.78,
+      "rtt_ms": 30.6,
+      "net_latency_ms": 30.6,
+      "bandwidth_mbps": 500,
+      "price_cents_s": 0.0196,
+      "cold_start_ms": 3432.9
     }
   },
   {
     "id": "inst_exp3_rep1",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.99,
-      "net_latency_ms": 3.3,
-      "price_cents_s": 0.0099,
-      "cold_start_ms": 154.6
+      "performance": 1.4,
+      "rtt_ms": 7.6,
+      "net_latency_ms": 7.6,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0147,
+      "cold_start_ms": 1352.8
     }
   },
   {
@@ -378,25 +468,31 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.8,
-      "net_latency_ms": 4.3,
-      "price_cents_s": 0.008,
-      "cold_start_ms": 488.2
+      "performance": 0.55,
+      "rtt_ms": 12.7,
+      "net_latency_ms": 12.7,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0055,
+      "cold_start_ms": 1232.4
     }
   },
   {
     "id": "inst_exp3_rep3",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
       "performance": 0.51,
-      "net_latency_ms": 5.7,
-      "price_cents_s": 0.0051,
-      "cold_start_ms": 2541.6
+      "rtt_ms": 211.7,
+      "net_latency_ms": 211.7,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0054,
+      "cold_start_ms": 175.0
     }
   },
   {
@@ -404,12 +500,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.51,
-      "net_latency_ms": 0.9,
-      "price_cents_s": 0.0151,
-      "cold_start_ms": 296.7
+      "performance": 1.88,
+      "rtt_ms": 6.0,
+      "net_latency_ms": 6.0,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0188,
+      "cold_start_ms": 1180.0
     }
   },
   {
@@ -417,12 +516,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.04,
-      "net_latency_ms": 2.4,
-      "price_cents_s": 0.0104,
-      "cold_start_ms": 3608.5
+      "performance": 1.11,
+      "rtt_ms": 8.2,
+      "net_latency_ms": 8.2,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0111,
+      "cold_start_ms": 538.4
     }
   },
   {
@@ -430,12 +532,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.65,
-      "net_latency_ms": 7.7,
-      "price_cents_s": 0.0065,
-      "cold_start_ms": 1547.0
+      "performance": 0.46,
+      "rtt_ms": 6.1,
+      "net_latency_ms": 6.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0046,
+      "cold_start_ms": 727.0
     }
   },
   {
@@ -443,12 +548,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.49,
-      "net_latency_ms": 3.4,
-      "price_cents_s": 0.0049,
-      "cold_start_ms": 1271.8
+      "performance": 0.54,
+      "rtt_ms": 5.8,
+      "net_latency_ms": 5.8,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0054,
+      "cold_start_ms": 333.5
     }
   },
   {
@@ -456,12 +564,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.45,
-      "net_latency_ms": 1.3,
-      "price_cents_s": 0.0145,
-      "cold_start_ms": 570.9
+      "performance": 1.83,
+      "rtt_ms": 3.9,
+      "net_latency_ms": 3.9,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0183,
+      "cold_start_ms": 309.4
     }
   },
   {
@@ -469,12 +580,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.93,
+      "performance": 0.68,
+      "rtt_ms": 4.7,
       "net_latency_ms": 4.7,
-      "price_cents_s": 0.0093,
-      "cold_start_ms": 414.6
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0068,
+      "cold_start_ms": 1955.2
     }
   },
   {
@@ -482,12 +596,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.7,
-      "net_latency_ms": 11.1,
-      "price_cents_s": 0.007,
-      "cold_start_ms": 329.8
+      "performance": 0.62,
+      "rtt_ms": 1.6,
+      "net_latency_ms": 1.6,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0062,
+      "cold_start_ms": 553.6
     }
   },
   {
@@ -495,38 +612,47 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.36,
-      "net_latency_ms": 7.6,
-      "price_cents_s": 0.0036,
-      "cold_start_ms": 323.1
+      "performance": 0.28,
+      "rtt_ms": 6.1,
+      "net_latency_ms": 6.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0028,
+      "cold_start_ms": 200.3
     }
   },
   {
     "id": "inst_exp6_rep0",
-    "region": "local",
+    "region": "far",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.55,
-      "net_latency_ms": 10.8,
-      "price_cents_s": 0.0155,
-      "cold_start_ms": 147.2
+      "performance": 1.85,
+      "rtt_ms": 137.0,
+      "net_latency_ms": 137.0,
+      "bandwidth_mbps": 500,
+      "price_cents_s": 0.0204,
+      "cold_start_ms": 433.9
     }
   },
   {
     "id": "inst_exp6_rep1",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.93,
-      "net_latency_ms": 2.2,
-      "price_cents_s": 0.0093,
-      "cold_start_ms": 969.2
+      "performance": 1.43,
+      "rtt_ms": 22.4,
+      "net_latency_ms": 22.4,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.015,
+      "cold_start_ms": 1194.1
     }
   },
   {
@@ -534,25 +660,31 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.65,
-      "net_latency_ms": 2.3,
-      "price_cents_s": 0.0065,
-      "cold_start_ms": 376.4
+      "performance": 0.64,
+      "rtt_ms": 17.2,
+      "net_latency_ms": 17.2,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0064,
+      "cold_start_ms": 214.1
     }
   },
   {
     "id": "inst_exp6_rep3",
-    "region": "local",
+    "region": "near",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.44,
-      "net_latency_ms": 1.5,
-      "price_cents_s": 0.0044,
-      "cold_start_ms": 350.5
+      "performance": 0.3,
+      "rtt_ms": 65.5,
+      "net_latency_ms": 65.5,
+      "bandwidth_mbps": 2000,
+      "price_cents_s": 0.0032,
+      "cold_start_ms": 260.3
     }
   },
   {
@@ -560,12 +692,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.46,
-      "net_latency_ms": 5.2,
-      "price_cents_s": 0.0146,
-      "cold_start_ms": 387.0
+      "performance": 2.02,
+      "rtt_ms": 2.1,
+      "net_latency_ms": 2.1,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0202,
+      "cold_start_ms": 883.1
     }
   },
   {
@@ -573,25 +708,31 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 1.1,
-      "net_latency_ms": 4.8,
-      "price_cents_s": 0.011,
-      "cold_start_ms": 1080.5
+      "performance": 1.33,
+      "rtt_ms": 1.4,
+      "net_latency_ms": 1.4,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0133,
+      "cold_start_ms": 194.4
     }
   },
   {
     "id": "inst_exp7_rep2",
-    "region": "local",
+    "region": "far",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.57,
-      "net_latency_ms": 1.8,
-      "price_cents_s": 0.0057,
-      "cold_start_ms": 293.0
+      "performance": 0.74,
+      "rtt_ms": 42.2,
+      "net_latency_ms": 42.2,
+      "bandwidth_mbps": 500,
+      "price_cents_s": 0.0081,
+      "cold_start_ms": 2011.2
     }
   },
   {
@@ -599,12 +740,15 @@
     "region": "local",
     "cpu_cores": 4,
     "memory_mb": 8192,
+    "max_concurrency": 2,
     "meta": {
       "device": "gpu",
-      "performance": 0.58,
-      "net_latency_ms": 4.1,
-      "price_cents_s": 0.0058,
-      "cold_start_ms": 4048.3
+      "performance": 0.38,
+      "rtt_ms": 4.5,
+      "net_latency_ms": 4.5,
+      "bandwidth_mbps": 10000,
+      "price_cents_s": 0.0038,
+      "cold_start_ms": 1168.6
     }
   }
 ]

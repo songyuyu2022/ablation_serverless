@@ -1,9 +1,9 @@
 # ============================================
 # run_local.ps1 - Headless Local Simulation
+# Multi-seed + Results Directory (ICWS-ready)
 # ============================================
 
 Write-Host ">>> Activating virtual environment..."
-# 检查多种可能的 venv 路径，增强兼容性
 $venv_paths = @(".\\.venv\\Scripts\\Activate.ps1", ".\\venv\\Scripts\\Activate.ps1")
 $venv_found = $false
 foreach ($path in $venv_paths) {
@@ -13,132 +13,183 @@ foreach ($path in $venv_paths) {
         break
     }
 }
-
 if (-not $venv_found) {
-    Write-Host "[WARNING] Virtual environment not found in standard paths. Assuming Python is in PATH."
+    Write-Host "[WARNING] Virtual environment not found. Assuming Python is in PATH."
 }
 
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Set-Location $ROOT
 Write-Host ">>> Project root = $ROOT"
 
-# --------------------------------------------
+# ------------------------------------------------
 # Global env
-# --------------------------------------------
-$env:COMM_SIM_DIR        = "comm_sim"
-$env:INSTANCES_FILE      = "instances.json"
-$env:FUNC_MAP_FILE       = "func_map.json"
-$env:CUDA_VISIBLE_DEVICES = ""      # CPU only for controller logic
+# ------------------------------------------------
+$env:COMM_SIM_DIR          = "comm_sim"
+$env:INSTANCES_FILE        = "instances.json"
+$env:FUNC_MAP_FILE         = "func_map.json"
+$env:CUDA_VISIBLE_DEVICES  = ""
 
-# --------------------------------------------
-# KEY CONFIG: Enable Local Compute Mode
-# --------------------------------------------
-# "0" = Do NOT use external HTTP uvicorn servers
-$env:USE_HTTP_EXEC="0"
-# "1" = Enable In-Process LocalExecutor (Crucial for your new architecture)
-$env:LOCAL_COMPUTE="1"
+$env:USE_HTTP_EXEC = "0"
+$env:LOCAL_COMPUTE = "1"
 
-# --------------------------------------------
-# Simulation Knobs (关键参数修正区)
-# --------------------------------------------
-# 1. 网络延迟基准：设为 50ms，模拟跨地域延迟
-#    HeatMoE 优化后 (0.5x) => 25ms，显著区别于计算时间
-$env:DEFAULT_NET_LATENCY_MS="50.0"
+$env:DEFAULT_NET_LATENCY_MS = "50.0"
+$env:USE_TRACE_CALIB        = "1"
 
-# 2. 真实 Trace 仿真开关：强制关闭
-#    确保使用我们设定的 base_compute_ms (约13ms)，避免 5000ms 的异常值
-$env:USE_TRACE_CALIB="0"
+# Local transient failures (serverless realism)
+$env:LOCAL_OOM_PROB  = "0.01"   # main experiments: small but non-zero
+$env:LOCAL_BUSY_PROB = "0.00"   # usually keep 0 unless stress testing
 
-# 其他热点参数
-$env:HOTSPOT_DRIFT_EVERY="50"
-$env:HOT_PROB="0.85"
-$env:WARM_PROB="0.10"
-$env:LOCAL_OOM_PROB="0"
+# 重试退避（更像真实 serverless）
+$env:RETRY_BACKOFF_MS      = "5"
+$env:RETRY_BACKOFF_MAX_MS  = "50"
 
-# Serverless realism
-$env:KEEP_ALIVE_MS="5000"
-$env:EVICTION_BASE_PROB="0.02"
-$env:EVICTION_TAU_MS="20000"
+# Network latency sanity protection
+$env:MIN_NET_LATENCY_RATIO = "0.05"
 
+$env:KEEP_ALIVE_MS        = "5000"
+$env:EVICTION_BASE_PROB   = "0.02"
+$env:EVICTION_TAU_MS      = "20000"
+
+#拉大压力
+$env:EXP_MAX_CONCURRENCY="1"
+$env:HOT_PROB="0.75"
+$env:COLD_EXPERT_LOAD_MS="400"
+
+if (-not $env:MAX_STEPS) {
+    $env:MAX_STEPS = "100"
+}
+
+# ------------------------------------------------
+# Result root directory (NEW)
+# ------------------------------------------------
+$RESULT_ROOT = Join-Path $ROOT "results"
+if (-not (Test-Path $RESULT_ROOT)) {
+    New-Item -ItemType Directory -Path $RESULT_ROOT | Out-Null
+}
+
+# 每次 run 一个独立目录（时间戳）
+$TS = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$RUN_DIR = Join-Path $RESULT_ROOT $TS
+New-Item -ItemType Directory -Path $RUN_DIR | Out-Null
+
+Write-Host ">>> Results will be saved to:"
+Write-Host "    $RUN_DIR" -ForegroundColor Yellow
+
+# ------------------------------------------------
+# Menu
+# ------------------------------------------------
 Write-Host "================================================"
-Write-Host "    Serverless MoE Local Simulation (No-GUI)    "
-Write-Host "    Mode: LocalExecutor (In-Process)            "
-Write-Host "    Config: Net=50ms, Trace=OFF                 "
+Write-Host " Serverless MoE Local Simulation"
+Write-Host " Multi-Seed + Result Directory"
 Write-Host "================================================"
-Write-Host " [1] Run Ours (HeatMoE Full)"
-Write-Host " [2] Run Ablation (No-NSGA, No-HotCold, etc.)"
-Write-Host " [3] Run Baselines (Random, Round Robin)"
-Write-Host " [4] Run ALL Experiments (Paper Full Set)"
+Write-Host " [1] Run Ours (Full)"
+Write-Host " [2] Run Ablations"
+Write-Host " [3] Run Baselines"
+Write-Host " [4] Run ALL (Paper Set)"
+Write-Host "================================================"
+Write-Host " [S] Single seed"
+Write-Host " [M] Multi-seed (0,1,2)"
 Write-Host "================================================"
 
-$choice = Read-Host "Enter your choice (1-4)"
+$choice = Read-Host "Enter choice (e.g. 4 M)"
 
-# [新增] 清理函数：防止上一次实验的残留文件影响本次实验
+$parts = $choice.Trim().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+$exp_choice = $parts[0]
+$seed_mode = if ($parts.Length -ge 2) { $parts[1].ToUpper() } else { "M" }
+
+# Seeds
+if ($seed_mode -eq "S") {
+    $seed_in = Read-Host "Enter SEED (default 0)"
+    if ([string]::IsNullOrWhiteSpace($seed_in)) { $seed_in = "0" }
+    $seeds = @([int]$seed_in)
+} else {
+    $seeds = @(0,1,2)
+}
+
+# ------------------------------------------------
+# Cleanup
+# ------------------------------------------------
 function Cleanup-Data {
-    # 1. [核心] 清理仿真存储 (必须)
     if (Test-Path "comm_sim") {
-        Write-Host ">>> [Cleanup] Removing storage directory (comm_sim)..." -ForegroundColor Yellow
         Remove-Item -Path "comm_sim" -Recurse -Force -ErrorAction SilentlyContinue
     }
-
-    # 2. [可选] 清理 Python 缓存 (推荐清理，防止代码修改不生效)
-    Get-ChildItem -Path . -Recurse -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-    # 等待文件锁释放
+    Get-ChildItem -Path . -Recurse -Filter "__pycache__" |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 200
 }
 
+# ------------------------------------------------
+# Run controller
+# ------------------------------------------------
 function Run-Controller {
-    param([string]$etype, [string]$mode)
+    param([string]$etype, [string]$mode, [int]$seed)
 
-    # 每次运行前清理数据
+    $env:SEED = $seed.ToString()
     Cleanup-Data
 
+    # 子目录（按实验类型）
+    $subdir = Join-Path $RUN_DIR $etype
+    if (-not (Test-Path $subdir)) {
+        New-Item -ItemType Directory -Path $subdir | Out-Null
+    }
+
     if ($etype -eq "baseline") {
-        $env:EXPERIMENT_TYPE="baseline"
-        $env:BASELINE_MODE=$mode
-        $env:METRICS_FILE="metrics_baseline_$mode.csv"
+        $env:EXPERIMENT_TYPE = "baseline"
+        $env:BASELINE_MODE  = $mode
+        $env:METRICS_FILE   = Join-Path $subdir ("metrics_baseline_{0}_seed{1}.csv" -f $mode, $seed)
     } else {
-        $env:EXPERIMENT_TYPE="ablation"
-        $env:ABLATION_MODE=$mode
-        $env:METRICS_FILE="metrics_$mode.csv"
+        $env:EXPERIMENT_TYPE = "ablation"
+        $env:ABLATION_MODE  = $mode
+        $env:METRICS_FILE   = Join-Path $subdir ("metrics_{0}_seed{1}.csv" -f $mode, $seed)
     }
 
-    # 如果目标 CSV 存在，先删除，保证数据是新的
-    if (Test-Path $env:METRICS_FILE) {
-        Remove-Item $env:METRICS_FILE
-    }
+    Write-Host ">>> Running $etype / $mode / seed=$seed"
+    Write-Host ">>> Output: $env:METRICS_FILE" -ForegroundColor Green
 
-    Write-Host ">>> Running controller: type=$etype mode=$mode output=$env:METRICS_FILE" -ForegroundColor Green
     python controller.py
 
-    Write-Host ">>> Finished $mode. Data saved to $env:METRICS_FILE" -ForegroundColor Cyan
+    Write-Host ">>> Finished $etype / $mode / seed=$seed" -ForegroundColor Cyan
     Write-Host "------------------------------------------------"
 }
 
-switch ($choice) {
-    "1" { Run-Controller -etype "ablation" -mode "full" }
-    "2" {
-        # 已移除 static_compute，只保留有意义的消融实验
-        $modes = @("no_nsga", "no_online", "no_hotcold")
-        foreach ($m in $modes) { Run-Controller -etype "ablation" -mode $m }
-    }
-    "3" {
-        # 已移除 greedy，只保留核心对比基线
-        $modes = @("round_robin", "random")
-        foreach ($m in $modes) { Run-Controller -etype "baseline" -mode $m }
-    }
-    "4" {
-        # 自动跑全套论文数据
-        # 1. Ours
-        Run-Controller -etype "ablation" -mode "full"
+# ------------------------------------------------
+# Dispatch
+# ------------------------------------------------
+function Run-Choice {
+    param([string]$c, [int]$seed)
 
-        # 2. Baselines (对比组)
-        $bl = @("round_robin", "random")
-        foreach ($m in $bl) { Run-Controller -etype "baseline" -mode $m }
-
-        # 3. Ablations (消融组)
-        $ab = @("no_hotcold", "no_nsga", "no_online")
-        foreach ($m in $ab) { Run-Controller -etype "ablation" -mode $m }
+    switch ($c) {
+        "1" { Run-Controller "ablation" "full" $seed }
+        "2" {
+            foreach ($m in @("no_nsga","no_online","no_hotcold")) {
+                Run-Controller "ablation" $m $seed
+            }
+        }
+        "3" {
+            foreach ($m in @("round_robin","random")) {
+                Run-Controller "baseline" $m $seed
+            }
+        }
+        "4" {
+            Run-Controller "ablation" "full" $seed
+            foreach ($m in @("round_robin","random")) {
+                Run-Controller "baseline" $m $seed
+            }
+            foreach ($m in @("no_hotcold","no_nsga","no_online")) {
+                Run-Controller "ablation" $m $seed
+            }
+        }
+        Default { Write-Host "Invalid selection." }
     }
-    Default { Write-Host "Invalid selection." }
 }
+
+foreach ($s in $seeds) {
+    Write-Host "=============================="
+    Write-Host " Running seed = $s"
+    Write-Host "=============================="
+    Run-Choice $exp_choice $s
+}
+
+Write-Host "All runs finished."
+Write-Host "Results saved under:"
+Write-Host "  $RUN_DIR" -ForegroundColor Yellow
