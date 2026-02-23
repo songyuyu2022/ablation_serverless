@@ -19,6 +19,15 @@ class StepMetrics:
 
     # --- 3. 性能分析 (Fig 2 / Fig 3: 步时长与稳定性) ---
     step_time_ms: float = 0.0
+    # 【新增】滚动长尾/稳定性指标（最近窗口）
+    step_time_p95_ms: float = 0.0
+    step_time_p99_ms: float = 0.0
+    step_time_cv: float = 0.0
+
+    # global（从开始到当前 step 的累计）
+    step_time_global_p95_ms: float = 0.0
+    step_time_global_p99_ms: float = 0.0
+    step_time_global_cv: float = 0.0
 
     # 【Fig Y】预测器准确性
     predictor_r2: float = 0.0

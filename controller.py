@@ -21,15 +21,34 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 from comm import CommManager
 # ✅ 使用你项目既有的序列化协议
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor
+
+# ============================================================
+# Tensor transport helper:
+# - When SERIALIZE_TENSORS=True: use existing pack protocol (CPU copy)
+# - When SERIALIZE_TENSORS=False: pass tensors directly (safe only for local in-process executor)
+# ============================================================
+def _maybe_pack_tensor(t: torch.Tensor):
+    if t is None:
+        return None
+    if SERIALIZE_TENSORS:
+        tt = t.detach()
+        if tt.is_cuda:
+            tt = tt.to("cpu")
+        return tensor_to_pack(tt)
+    return t
 # 引入适配器
 from makemoe_adapter import MakeMoEAdapter
 from makeMoE import MakeMoEConfig
 from comm import CommManager
 import requests
 from collections import deque
+import contextlib
 # [Insert in controller.py] 辅助类：计算预测器 R2 Score
 class PredictionMonitor:
     """
@@ -242,7 +261,23 @@ PATH_HEALTH = os.getenv("PATH_HEALTH", "/health")
 # Async backward policy
 COLD_ACC_STEPS = int(os.getenv("COLD_ACC_STEPS", "4"))
 FORCE_SYNC_UPDATE = os.getenv("FORCE_SYNC_UPDATE", "0") == "1"
-DEVICE = os.getenv("DEVICE", "cpu")
+DEVICE = os.getenv("DEVICE", "auto")
+# auto: use cuda if available
+if DEVICE.lower() in ["auto", ""]:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+AMP_ENABLED = os.getenv("AMP_ENABLED", "1") == "1"
+AMP_DTYPE = os.getenv("AMP_DTYPE", "fp16").lower()  # fp16/bf16
+SERIALIZE_TENSORS = os.getenv("SERIALIZE_TENSORS", "")
+if SERIALIZE_TENSORS == "":
+    # In local in-process mode, avoid CPU packing by default on GPU to reduce OOM risk.
+    SERIALIZE_TENSORS = "0" if DEVICE.startswith("cuda") else "1"
+SERIALIZE_TENSORS = (SERIALIZE_TENSORS == "1")
+if DEVICE.startswith("cuda"):
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
 
 # ============================================================
 # Autoscaling Configuration
@@ -355,6 +390,241 @@ class LocalExecutor:
         if key not in payload: return None
         return _to_tensor(payload[key], device=self.device)
 
+    def _pack_tensor(self, t: torch.Tensor):
+        """Pack tensor for transport/logging.
+
+        - If SERIALIZE_TENSORS=True: keep existing CPU-friendly packed dict protocol.
+        - If SERIALIZE_TENSORS=False: pass tensors directly (safe only for local in-process executor).
+        """
+        if t is None:
+            return None
+        if SERIALIZE_TENSORS:
+            tt = t.detach()
+            if tt.is_cuda:
+                tt = tt.to("cpu")
+            return tensor_to_pack(tt)
+        return t.detach()
+
+    def _autocast_ctx(self):
+        if (self.device.type == "cuda") and AMP_ENABLED:
+            dtype = torch.float16 if AMP_DTYPE == "fp16" else torch.bfloat16
+            return torch.autocast(device_type="cuda", dtype=dtype)
+        return contextlib.nullcontext()
+
+    def _save_tensor(self, key: str, data: Dict[str, Any], mode: str, force_hot: bool = False):
+        # Keep original semantics: hot path for most traffic; cold path for designated cold mode.
+        if force_hot or mode not in ["cold"]:
+            self.comm.send_hot(key, data)
+        else:
+            self.comm.send_cold(key, data)
+
+    def _load_tensor(self, key: str, mode: str, delete: bool = True, try_hot_first: bool = False):
+        target_mode = mode if mode in ["hot", "cold"] else "hot"
+        if try_hot_first:
+            data = self.comm.pull_hot(key, delete=delete)
+            if data is not None:
+                return data
+        if target_mode == "cold":
+            return self.comm.pull_cold(key, delete=delete)
+        return self.comm.pull_hot(key, delete=delete)
+
+    async def run(self, func_name: str, path: str, payload: Dict[str, Any], mode: str = "hot") -> Dict[str, Any]:
+        """In-process execution path for LocalExecutor.
+
+        This provides the interface expected by `_invoke_fn`: `await LOCAL_EXECUTOR.run(func_name, http_path, payload)`.
+        It does NOT change simulator semantics; it only fixes the missing method due to an indentation regression.
+        """
+        t_start = time.perf_counter()
+
+        async with self.lock:
+            trace_id = payload.get("trace_id") or f"local_{uuid.uuid4()}"
+
+            res_data: Dict[str, Any] = {"ok": False}
+
+            # ---- Forward ----
+            if path == PATH_FWD:
+                if "pre" in func_name:
+                    x = self._unpack_tensor(payload, "x")
+                    with self._autocast_ctx():
+                        res = self.pre(x)
+
+                    # Save for backward (match original intent)
+                    try:
+                        self._save_tensor(f"{trace_id}_pre", {"x": self._pack_tensor(x)}, mode, force_hot=True)
+                    except Exception:
+                        pass
+
+                    res_data = {
+                        "ok": True,
+                        "trace_id": trace_id,
+                        "expert_inputs": {eid: self._pack_tensor(t) for eid, t in res["expert_inputs"].items()},
+                        "context": {
+                            "residual": self._pack_tensor(res["context"]["residual"]),
+                            "topk_idx": self._pack_tensor(res["context"]["topk_idx"]),
+                            "topk_weights": self._pack_tensor(res["context"]["topk_weights"]),
+                        },
+                        "h": self._pack_tensor(res["hidden_states"]),
+                        "topk_idx": self._pack_tensor(res["expert_indices"]),
+                        "topk_vals": self._pack_tensor(res["expert_weights"]),
+                    }
+
+                elif "expert" in func_name:
+                    eid = int(func_name.split(":")[-1])
+                    inp = self._unpack_tensor(payload, "inp")
+                    with self._autocast_ctx():
+                        out = self.experts[eid](inp)
+
+                    # Save for backward
+                    try:
+                        self._save_tensor(f"{trace_id}_exp_{eid}", {"inp": self._pack_tensor(inp)}, mode, force_hot=True)
+                    except Exception:
+                        pass
+
+                    res_data = {"ok": True, "trace_id": trace_id, "out": self._pack_tensor(out)}
+
+                elif "post" in func_name:
+                    results = payload.get("expert_results", [])
+                    expert_outs = [self._unpack_tensor(r, "out") for r in results]
+                    ctx_raw = payload.get("pre_context", {})
+                    context = {
+                        "residual": self._unpack_tensor(ctx_raw, "residual"),
+                        "topk_idx": self._unpack_tensor(ctx_raw, "topk_idx"),
+                        "topk_weights": self._unpack_tensor(ctx_raw, "topk_weights"),
+                    }
+                    y = self._unpack_tensor(payload, "targets")
+
+                    with self._autocast_ctx():
+                        logits, loss = self.post(expert_outs, context, targets=y)
+
+                    # Cache for backward
+                    if not hasattr(self, "_loss_cache"):
+                        self._loss_cache = {}
+                    self._loss_cache[trace_id] = {"loss": loss, "logits": logits}
+
+                    # Compute acc5 (keep original behavior)
+                    with torch.no_grad():
+                        b_logits = logits.view(-1, logits.size(-1))
+                        b_y = y.view(-1)
+                        _, pred = b_logits.topk(5, dim=-1)
+                        correct = pred.eq(b_y.unsqueeze(-1).expand_as(pred))
+                        acc5_val = correct.any(dim=-1).float().mean().item()
+
+                    res_data = {
+                        "ok": True,
+                        "trace_id": trace_id,
+                        "logits": self._pack_tensor(logits.detach()),
+                        "acc5": acc5_val,
+                        "loss": loss.item() if loss is not None else 0.0,
+                    }
+
+            # ---- Backward ----
+            elif path == PATH_BWD:
+                if "post" in func_name:
+                    cache = getattr(self, "_loss_cache", {}).get(trace_id)
+                    if cache:
+                        self.opt_post.zero_grad(set_to_none=True)
+                        cache["loss"].backward()
+                        # NOTE: original code attempted to return combined grad; keep minimal ok response
+                        res_data = {"ok": True}
+                        try:
+                            del self._loss_cache[trace_id]
+                        except Exception:
+                            pass
+                    else:
+                        res_data = {"ok": False, "error": "loss cache missing"}
+
+                elif "expert" in func_name:
+                    eid = int(func_name.split(":")[-1])
+                    save_key = f"{trace_id}_exp_{eid}"
+                    saved_data = self._load_tensor(save_key, mode, delete=True, try_hot_first=True)
+                    if saved_data:
+                        inp = _to_tensor(saved_data["inp"], device=self.device).requires_grad_(True)
+                        with self._autocast_ctx():
+                            out = self.experts[eid](inp)
+                        grad_out = self._unpack_tensor(payload, "grad_out")
+                        self.opt_exps[eid].zero_grad(set_to_none=True)
+                        out.backward(grad_out)
+                        res_data = {"ok": True, "grad_inp": self._pack_tensor(inp.grad)}
+                    else:
+                        res_data = {"ok": False, "error": "expert trace not found"}
+
+                elif "pre" in func_name:
+                    save_key = f"{trace_id}_pre"
+                    saved_data = self._load_tensor(save_key, mode, delete=True)
+                    if saved_data:
+                        x = _to_tensor(saved_data["x"], device=self.device)
+                        if x.dtype != torch.long:
+                            x = x.long()
+                        with self._autocast_ctx():
+                            res = self.pre(x)
+                        h = res["hidden_states"]
+                        grad_h = self._unpack_tensor(payload, "grad_h")
+                        self.opt_pre.zero_grad(set_to_none=True)
+                        h.backward(grad_h)
+                        res_data = {"ok": True}
+                    else:
+                        res_data = {"ok": False, "error": "pre trace not found"}
+
+            # ---- Optimizer step / zero ----
+            elif path in [PATH_STEP, PATH_ZERO]:
+                try:
+                    if "pre" in func_name:
+                        if path == PATH_STEP:
+                            self.opt_pre.step()
+                        else:
+                            self.opt_pre.zero_grad(set_to_none=True)
+                    if "post" in func_name:
+                        if path == PATH_STEP:
+                            self.opt_post.step()
+                        else:
+                            self.opt_post.zero_grad(set_to_none=True)
+                    if "expert" in func_name:
+                        eid = int(func_name.split(":")[-1])
+                        if path == PATH_STEP:
+                            self.opt_exps[eid].step()
+                        else:
+                            self.opt_exps[eid].zero_grad(set_to_none=True)
+                    res_data = {"ok": True}
+                except Exception as e:
+                    res_data = {"ok": False, "error": str(e)}
+
+            # ---- attach latency/cost metadata ----
+            actual_ms = (time.perf_counter() - t_start) * 1000.0
+            price_rate = 0.00000021
+            res_data.update({
+                "actual_lat": actual_ms,
+                "comp_lat": actual_ms,
+                "net_lat": 0.0,
+                "queue_lat": 0.0,
+                "cost_usd": actual_ms * price_rate,
+                "is_cold": False,
+                "cold_penalty": 0.0,
+                "func_name": func_name,
+            })
+            return res_data
+
+
+
+def _pack_tensor(self, t: torch.Tensor):
+    """Pack tensor for transport/logging. In local in-process GPU mode, avoid CPU serialization by default."""
+    if t is None:
+        return None
+    if SERIALIZE_TENSORS:
+        # existing protocol expects CPU-friendly packed dict
+        tt = t.detach()
+        if tt.is_cuda:
+            tt = tt.to("cpu")
+        return tensor_to_pack(tt)
+    # direct tensor pass (in-process only)
+    return t.detach()
+
+def _autocast_ctx(self):
+    if (self.device.type == "cuda") and AMP_ENABLED:
+        dtype = torch.float16 if AMP_DTYPE == "fp16" else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return contextlib.nullcontext()
+
+
     def _save_tensor(self, key: str, data: Dict[str, Any], mode: str, force_hot: bool = False):
         if force_hot or mode not in ["cold"]:
             self.comm.send_hot(key, data)
@@ -387,26 +657,28 @@ class LocalExecutor:
             if path == PATH_FWD:
                 if "pre" in func_name:
                     x = self._unpack_tensor(payload, "x")
-                    res = self.pre(x)
+                    with self._autocast_ctx():
+                        res = self.pre(x)
                     res_data = {
                         "ok": True,
                         "trace_id": trace_id,
-                        "expert_inputs": {eid: tensor_to_pack(t) for eid, t in res["expert_inputs"].items()},
+                        "expert_inputs": {eid: self._pack_tensor(t) for eid, t in res["expert_inputs"].items()},
                         "context": {
-                            "residual": tensor_to_pack(res["context"]["residual"]),
-                            "topk_idx": tensor_to_pack(res["context"]["topk_idx"]),
-                            "topk_weights": tensor_to_pack(res["context"]["topk_weights"])
+                            "residual": self._pack_tensor(res["context"]["residual"]),
+                            "topk_idx": self._pack_tensor(res["context"]["topk_idx"]),
+                            "topk_weights": self._pack_tensor(res["context"]["topk_weights"])
                         },
-                        "h": tensor_to_pack(res["hidden_states"]),
-                        "topk_idx": tensor_to_pack(res["expert_indices"]),
-                        "topk_vals": tensor_to_pack(res["expert_weights"])
+                        "h": self._pack_tensor(res["hidden_states"]),
+                        "topk_idx": self._pack_tensor(res["expert_indices"]),
+                        "topk_vals": self._pack_tensor(res["expert_weights"])
                     }
 
                 elif "expert" in func_name:
                     eid = int(func_name.split(":")[-1])
                     inp = self._unpack_tensor(payload, "inp")
-                    out = self.experts[eid](inp)
-                    res_data = {"ok": True, "trace_id": trace_id, "out": tensor_to_pack(out)}
+                    with self._autocast_ctx():
+                        out = self.experts[eid](inp)
+                    res_data = {"ok": True, "trace_id": trace_id, "out": self._pack_tensor(out)}
 
                 elif "post" in func_name:
                     results = payload.get("expert_results", [])
@@ -418,7 +690,8 @@ class LocalExecutor:
                         "topk_weights": self._unpack_tensor(ctx_raw, "topk_weights")
                     }
                     y = self._unpack_tensor(payload, "targets")
-                    logits, loss = self.post(expert_outs, context, targets=y)
+                    with self._autocast_ctx():
+                        logits, loss = self.post(expert_outs, context, targets=y)
 
                     # 💡 [关键修复] 必须缓存 loss 对象，否则反向传播拿不到梯度
                     if not hasattr(self, "_loss_cache"): self._loss_cache = {}
@@ -442,7 +715,7 @@ class LocalExecutor:
                     res_data = {
                         "ok": True,
                         "trace_id": trace_id,
-                        "logits": tensor_to_pack(logits.detach()),
+                        "logits": self._pack_tensor(logits.detach()),
                         "acc5": acc5_val,
                         "loss": loss.item() if loss is not None else 0.0
                     }
@@ -455,7 +728,7 @@ class LocalExecutor:
                         self.opt_post.zero_grad()
                         cache["loss"].backward()
                         # 获取梯度逻辑...
-                        res_data = {"ok": True, "grad_combined": tensor_to_pack(
+                        res_data = {"ok": True, "grad_combined": self._pack_tensor(
                             cache["logits"].grad or torch.zeros_like(cache["logits"]))}
                         del self._loss_cache[trace_id]  # 释放内存
                     else:
@@ -472,7 +745,7 @@ class LocalExecutor:
                             grad_out = self._unpack_tensor(payload, "grad_out")
                             self.opt_exps[eid].zero_grad()
                             out.backward(grad_out)
-                            res_data = {"ok": True, "grad_inp": tensor_to_pack(inp.grad)}
+                            res_data = {"ok": True, "grad_inp": self._pack_tensor(inp.grad)}
                         else:
                             res_data = {"ok": False, "error": "Trace not found"}
                     except Exception as e:
@@ -1591,7 +1864,7 @@ async def run_microbatch(step: int, micro_step: int, x: torch.Tensor, y: torch.T
     # 2. Forward 流程
     # ============================================================
     # Pre Stage
-    _, pre_obj, bd1, _ = await _invoke_fn("moe.pre_fwd", mode="http", payload={"x": tensor_to_pack(x_tok)},
+    _, pre_obj, bd1, _ = await _invoke_fn("moe.pre_fwd", mode="http", payload={"x": _maybe_pack_tensor(x_tok)},
                                           base_compute_ms=10.0, http_path=PATH_FWD, global_step=step)
     all_mb_rows.append(bd1)
 
@@ -1613,7 +1886,7 @@ async def run_microbatch(step: int, micro_step: int, x: torch.Tensor, y: torch.T
     _, post_obj, bd3, _ = await _invoke_fn("moe.post_fwd", mode="http",
                                            payload={"expert_results": exp_outs,
                                                     "pre_context": pre_obj.get("context", {}),
-                                                    "targets": tensor_to_pack(y_tok)},
+                                                    "targets": _maybe_pack_tensor(y_tok)},
                                            base_compute_ms=10.0, http_path=PATH_FWD, global_step=step)
     all_mb_rows.append(bd3)
 

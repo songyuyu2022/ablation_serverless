@@ -56,7 +56,7 @@ $env:HOT_PROB="0.75"
 $env:COLD_EXPERT_LOAD_MS="400"
 
 if (-not $env:MAX_STEPS) {
-    $env:MAX_STEPS = "100"
+    $env:MAX_STEPS = "2000"
 }
 
 # ------------------------------------------------
