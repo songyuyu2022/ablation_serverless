@@ -21,34 +21,103 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+import torch.nn.functional as F
 from comm import CommManager
 # ✅ 使用你项目既有的序列化协议
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor
-
-# ============================================================
-# Tensor transport helper:
-# - When SERIALIZE_TENSORS=True: use existing pack protocol (CPU copy)
-# - When SERIALIZE_TENSORS=False: pass tensors directly (safe only for local in-process executor)
-# ============================================================
-def _maybe_pack_tensor(t: torch.Tensor):
-    if t is None:
-        return None
-    if SERIALIZE_TENSORS:
-        tt = t.detach()
-        if tt.is_cuda:
-            tt = tt.to("cpu")
-        return tensor_to_pack(tt)
-    return t
 # 引入适配器
 from makemoe_adapter import MakeMoEAdapter
 from makeMoE import MakeMoEConfig
 from comm import CommManager
 import requests
 from collections import deque
-import contextlib
+
+# ============================================================
+# Tail / stability metrics (rolling + global) and concurrency limiters
+# - rolling: recent N steps (for plots)
+# - global : approximate p95/p99 via bounded reservoir + exact CV via Welford (for tables)
+# ============================================================
+TAIL_STAT_WINDOW = int(os.getenv("TAIL_STAT_WINDOW", "200"))
+TAIL_STAT_MIN_SAMPLES = int(os.getenv("TAIL_STAT_MIN_SAMPLES", "5"))
+GLOBAL_STAT_RESERVOIR = int(os.getenv("GLOBAL_STAT_RESERVOIR", "5000"))
+
+# Rolling window per phase
+_STEP_TIME_ROLL: Dict[str, deque] = {"train": deque(maxlen=TAIL_STAT_WINDOW), "val": deque(maxlen=TAIL_STAT_WINDOW)}
+# Bounded reservoir samples for global percentiles
+_STEP_TIME_RES: Dict[str, List[float]] = {"train": [], "val": []}
+# Welford running stats for global CV (exact mean/std without storing all samples)
+_STEP_TIME_WELFORD: Dict[str, Dict[str, float]] = {
+    "train": {"n": 0.0, "mean": 0.0, "m2": 0.0},
+    "val": {"n": 0.0, "mean": 0.0, "m2": 0.0},
+}
+
+
+def _tail_stats_from_list(xs: List[float]) -> Tuple[float, float, float]:
+    """Return (p95, p99, cv) for a list of step_time_ms samples."""
+    n = len(xs)
+    if n < TAIL_STAT_MIN_SAMPLES:
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(xs, dtype=np.float64)
+    p95 = float(np.percentile(arr, 95))
+    p99 = float(np.percentile(arr, 99))
+    mu = float(arr.mean())
+    if mu <= 1e-12 or n < 2:
+        cv = 0.0
+    else:
+        cv = float(arr.std(ddof=0) / mu)
+    return p95, p99, cv
+
+
+def _welford_update(state: Dict[str, float], x: float) -> None:
+    n = state["n"] + 1.0
+    delta = x - state["mean"]
+    mean = state["mean"] + delta / n
+    delta2 = x - mean
+    m2 = state["m2"] + delta * delta2
+    state["n"] = n
+    state["mean"] = mean
+    state["m2"] = m2
+
+
+def _welford_cv(state: Dict[str, float]) -> float:
+    n = state["n"]
+    mean = state["mean"]
+    if n < 2 or abs(mean) <= 1e-12:
+        return 0.0
+    var = state["m2"] / n
+    std = math.sqrt(max(0.0, var))
+    return float(std / mean)
+
+
+def _reservoir_add(res: List[float], x: float, *, cap: int, seen: int) -> None:
+    """Reservoir sampling: keep at most cap samples, unbiased over stream."""
+    if cap <= 0:
+        return
+    if len(res) < cap:
+        res.append(x)
+        return
+    j = random.randint(0, max(0, seen - 1))
+    if j < cap:
+        res[j] = x
+
+
+# Concurrency limiters
+MAX_INFLIGHT_MICROBATCH = int(os.getenv("MAX_INFLIGHT_MICROBATCH", "1"))
+MAX_INFLIGHT_EXPERT = int(os.getenv("MAX_INFLIGHT_EXPERT", "1"))
+_MB_SEM = asyncio.Semaphore(MAX_INFLIGHT_MICROBATCH)
+_EXPERT_SEM = asyncio.Semaphore(MAX_INFLIGHT_EXPERT)
+
+
+async def _limited_mb(coro):
+    async with _MB_SEM:
+        return await coro
+
+
+async def _limited_expert(coro):
+    async with _EXPERT_SEM:
+        return await coro
+
+
 # [Insert in controller.py] 辅助类：计算预测器 R2 Score
 class PredictionMonitor:
     """
@@ -134,8 +203,9 @@ class PredictionMonitor:
         """
         return self.get_r2(), self.get_mae()
 
+
 # 实例化全局监控器
-PRED_MONITOR = PredictionMonitor()
+PRED_MONITOR = PredictionMonitor(window=int(os.getenv("PRED_MONITOR_WINDOW", "50")))
 
 class RealDataLoader:
     def __init__(self, block_size, batch_size):
@@ -178,6 +248,8 @@ class RealDataLoader:
         x = torch.stack([data[i:i + self.block_size] for i in ix])
         y = torch.stack([data[i + 1:i + self.block_size + 1] for i in ix])
         return x, y
+
+
 # ============================================================
 # Global Env
 # ============================================================
@@ -203,15 +275,15 @@ LOG_TRAIN_EVERY = int(os.getenv("LOG_TRAIN_EVERY", "20"))
 VAL_INTERVAL = int(os.getenv("VAL_INTERVAL", "100"))
 
 # Sequence / token LM batch
-SEQ_LEN = int(os.getenv("SEQ_LEN", "64"))
+SEQ_LEN = int(os.getenv("SEQ_LEN", "256"))
 DATA_PATH = os.getenv("DATA_PATH", "input.txt")
 VOCAB_PATH = os.getenv("VOCAB_PATH", "vocab.json")
 
 # MoE
-NUM_EXPERTS = int(os.getenv("NUM_EXPERTS", "4"))
+NUM_EXPERTS = int(os.getenv("NUM_EXPERTS", "16"))
 TOP_K = int(os.getenv("TOP_K", "2"))
 VOCAB_SIZE = int(os.getenv("VOCAB_SIZE", "2000"))
-EMB_DIM = int(os.getenv("EMB_DIM", "256"))
+EMB_DIM = int(os.getenv("EMB_DIM", "512"))
 
 # Hot/Cold logic
 HOTSET_SIZE = int(os.getenv("HOTSET_SIZE", "1"))
@@ -231,6 +303,7 @@ DEFAULT_PERFORMANCE = float(os.getenv("DEFAULT_PERFORMANCE", "1.0"))
 HOT_NET_MUL = float(os.getenv("HOT_NET_MUL", "0.5"))
 COLD_NET_MUL = float(os.getenv("COLD_NET_MUL", "2.0"))
 HTTP_NET_MUL = float(os.getenv("HTTP_NET_MUL", "1.0"))
+SHARED_NET_MUL = float(os.getenv("SHARED_NET_MUL", "0.2"))  # 内存级高速通道，默认更快
 FALLBACK_NET_MUL = float(os.getenv("FALLBACK_NET_MUL", "1.3"))
 COLD_STORAGE_MS = float(os.getenv("COLD_STORAGE_MS", "12.0"))
 
@@ -261,23 +334,7 @@ PATH_HEALTH = os.getenv("PATH_HEALTH", "/health")
 # Async backward policy
 COLD_ACC_STEPS = int(os.getenv("COLD_ACC_STEPS", "4"))
 FORCE_SYNC_UPDATE = os.getenv("FORCE_SYNC_UPDATE", "0") == "1"
-DEVICE = os.getenv("DEVICE", "auto")
-# auto: use cuda if available
-if DEVICE.lower() in ["auto", ""]:
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-AMP_ENABLED = os.getenv("AMP_ENABLED", "1") == "1"
-AMP_DTYPE = os.getenv("AMP_DTYPE", "fp16").lower()  # fp16/bf16
-SERIALIZE_TENSORS = os.getenv("SERIALIZE_TENSORS", "")
-if SERIALIZE_TENSORS == "":
-    # In local in-process mode, avoid CPU packing by default on GPU to reduce OOM risk.
-    SERIALIZE_TENSORS = "0" if DEVICE.startswith("cuda") else "1"
-SERIALIZE_TENSORS = (SERIALIZE_TENSORS == "1")
-if DEVICE.startswith("cuda"):
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ============================================================
 # Autoscaling Configuration
@@ -318,6 +375,11 @@ class AblationConfig:
             cfg.use_bsp = (m == "bsp")
             cfg.use_ssp = (m == "ssp")
             cfg.use_asp = (m == "asp")
+            if m in ["random", "round_robin"]:
+                cfg.disable_nsga = True  # 关掉统筹算法
+                cfg.disable_heuristic = True  # 关掉聪明打分公式
+            elif m == "greedy":
+                cfg.disable_nsga = True  # Greedy 只关掉统筹，保留打分
         else:
             m = ABLATION_MODE.lower()
             if m == "no_hotcold":
@@ -347,79 +409,153 @@ if FORCE_SYNC_UPDATE:
 # ============================================================
 # controller.py 中的 LocalExecutor 类
 class LocalExecutor:
-    # inside class LocalExecutor:
+    """
+    Local in-process executor for serverless MoE pipeline (v2).
+
+    v2 improvements:
+    - When FAST_LOCAL_BYPASS_COMM=1 and SERIALIZE_TENSORS=0:
+      * NO tensor_to_pack in the hot path
+      * pass torch.Tensor directly between stages
+      This avoids GPU->CPU sync/copies and typically boosts GPU utilization a lot.
+    - Optional AMP autocast + GradScaler (controlled by AMP_ENABLED/AMP_DTYPE)
+    - Fine-grained locks only (no global lock)
+    """
+
     def __init__(self):
         self.device = torch.device(DEVICE)
         print(f"[LocalExecutor] Initializing MakeMoE Adapter on {self.device}...")
 
-        # 💡 预先实例化 DataLoader 获取真实词表大小
+        # knobs
+        self.fast_bypass_comm = os.getenv("FAST_LOCAL_BYPASS_COMM", "1") == "1"
+        self.serialize_tensors = os.getenv("SERIALIZE_TENSORS", "0") == "1"
+        # direct tensor IO is the key for GPU util in local compute
+        self.direct_tensor_io = self.fast_bypass_comm and (not self.serialize_tensors)
+
+        # acc 计算频率：优先读 ACC_EVERY，其次 LOCAL_ACC_EVERY
+        self.compute_acc_every = int(os.getenv("ACC_EVERY", os.getenv("LOCAL_ACC_EVERY", "10")))
+        self.acc_fill_nan = (os.getenv("ACC_FILL_NAN", "0") == "1")
+        self._acc_counter = 0
+
+        # AMP
+        # AMP
+        self.amp_enabled = (os.getenv("AMP_ENABLED", "1") == "1") and (self.device.type == "cuda")
+
+        req = (os.getenv("AMP_DTYPE", "bf16") or "bf16").lower()
+        want_bf16 = req in ("bf16", "bfloat16")
+        want_fp16 = req in ("fp16", "float16", "16")
+
+        if self.amp_enabled and want_bf16 and torch.cuda.is_bf16_supported():
+            self.amp_dtype = torch.bfloat16
+        elif self.amp_enabled:
+            # fallback fp16
+            self.amp_dtype = torch.float16
+            if want_bf16 and (not torch.cuda.is_bf16_supported()):
+                print("[Warn] bf16 requested but not supported; fallback to fp16.", flush=True)
+        else:
+            # AMP disabled -> dtype doesn't matter, keep fp16 placeholder
+            self.amp_dtype = torch.float16
+
+        # TF32 (Ampere)
+        if os.getenv("LOCAL_TF32", "1") == "1" and self.device.type == "cuda":
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
+
+        # preload vocab size
         temp_loader = RealDataLoader(block_size=64, batch_size=4)
 
-        # 1. 实例化 MakeMoE 配置
         self.moe_cfg = MakeMoEConfig()
-
-        # 2. 【关键】用环境变量覆盖默认值
-        # 这样你在 run_local.ps1 里设置的 NUM_EXPERTS="8" 才会生效
         self.moe_cfg.vocab_size = temp_loader.vocab_size
-        self.moe_cfg.n_embed = EMB_DIM  # 对应环境变量 EMB_DIM
-        self.moe_cfg.num_experts = NUM_EXPERTS  # 对应环境变量 NUM_EXPERTS
+        self.moe_cfg.n_embed = EMB_DIM
+        self.moe_cfg.num_experts = NUM_EXPERTS
         self.moe_cfg.top_k = TOP_K
         self.moe_cfg.block_size = int(os.getenv("BLOCK_SIZE", "64"))
 
-        # 3. 初始化适配器 (选择第1层作为Serverless拆分层)
-        # 确保 split_layer_idx 不越界
         split_idx = min(1, self.moe_cfg.n_layer - 1)
         self.adapter = MakeMoEAdapter(self.moe_cfg, split_layer_idx=split_idx)
 
-        # 4. 获取各阶段模块 (Pre/Expert/Post)
         self.pre = self.adapter.get_pre_stage().to(self.device)
         self.post = self.adapter.get_post_stage().to(self.device)
-        self.experts = nn.ModuleList([
-            self.adapter.get_expert_stage(i).to(self.device) for i in range(NUM_EXPERTS)
-        ])
+        self.experts = nn.ModuleList([self.adapter.get_expert_stage(i).to(self.device) for i in range(NUM_EXPERTS)])
 
-        # 5. 初始化优化器 (保持不变)
-        self.opt_pre = torch.optim.AdamW(self.pre.parameters(), lr=1e-3)
-        self.opt_post = torch.optim.AdamW(self.post.parameters(), lr=1e-3)
-        self.opt_exps = [torch.optim.AdamW(e.parameters(), lr=1e-3) for e in self.experts]
+        self.opt_pre = torch.optim.AdamW(self.pre.parameters(), lr=float(os.getenv("LR_PRE", "1e-3")))
+        self.opt_post = torch.optim.AdamW(self.post.parameters(), lr=float(os.getenv("LR_POST", "1e-3")))
+        self.opt_exps = [torch.optim.AdamW(e.parameters(), lr=float(os.getenv("LR_EXP", "1e-3"))) for e in self.experts]
 
+        # keep CommManager for compatibility (won't be used in fast bypass)
         self.comm = CommManager()
-        self.lock = asyncio.Lock()
 
-    def _unpack_tensor(self, payload, key):
-        if key not in payload: return None
-        return _to_tensor(payload[key], device=self.device)
+        # fine-grained locks
+        self.cache_lock = asyncio.Lock()
+        self.mem_lock = asyncio.Lock()
 
-    def _pack_tensor(self, t: torch.Tensor):
-        """Pack tensor for transport/logging.
+        self.opt_pre_lock = asyncio.Lock()
+        self.opt_post_lock = asyncio.Lock()
+        self.opt_exp_locks = [asyncio.Lock() for _ in range(NUM_EXPERTS)]
 
-        - If SERIALIZE_TENSORS=True: keep existing CPU-friendly packed dict protocol.
-        - If SERIALIZE_TENSORS=False: pass tensors directly (safe only for local in-process executor).
-        """
-        if t is None:
+        # in-memory KV for local bypass
+        self._mem_kv: Dict[str, Dict[str, Any]] = {}
+        self._loss_cache: Dict[str, Dict[str, Any]] = {}
+
+        self.price_rate = float(os.getenv("LOCAL_PRICE_USD_PER_MS", "0.00000021"))
+
+        print(
+            f"[LocalExecutor] fast_bypass_comm={self.fast_bypass_comm}, "
+            f"serialize_tensors={self.serialize_tensors}, direct_tensor_io={self.direct_tensor_io}, "
+            f"amp_enabled={self.amp_enabled}, amp_dtype={self.amp_dtype}"
+        )
+
+    def _maybe_tensor(self, v: Any) -> Optional[torch.Tensor]:
+        """Convert packed tensor OR torch.Tensor to tensor on self.device."""
+        if v is None:
             return None
-        if SERIALIZE_TENSORS:
-            tt = t.detach()
-            if tt.is_cuda:
-                tt = tt.to("cpu")
-            return tensor_to_pack(tt)
-        return t.detach()
+        if isinstance(v, torch.Tensor):
+            return v.to(self.device, non_blocking=True)
+        # fallback: packed -> tensor
+        return _to_tensor(v, device=self.device)
 
-    def _autocast_ctx(self):
-        if (self.device.type == "cuda") and AMP_ENABLED:
-            dtype = torch.float16 if AMP_DTYPE == "fp16" else torch.bfloat16
-            return torch.autocast(device_type="cuda", dtype=dtype)
-        return contextlib.nullcontext()
+    def _unpack_tensor(self, payload: Dict[str, Any], key: str) -> Optional[torch.Tensor]:
+        if payload is None or key not in payload:
+            return None
+        return self._maybe_tensor(payload[key])
 
-    def _save_tensor(self, key: str, data: Dict[str, Any], mode: str, force_hot: bool = False):
-        # Keep original semantics: hot path for most traffic; cold path for designated cold mode.
-        if force_hot or mode not in ["cold"]:
+    async def _save_tensor(self, key: str, data: Dict[str, Any], mode: str, force_hot: bool = False):
+        m = (mode or "").lower()
+
+        # shared：永远走 CommManager 的 shared 通道（独立内存级高速链路）
+        if m == "shared":
+            self.comm.send_shared(key, data)
+            return
+
+        # 其它：允许 fast bypass（提升本地 GPU 利用率）
+        if self.fast_bypass_comm:
+            async with self.mem_lock:
+                self._mem_kv[key] = data
+            return
+
+        if force_hot or m != "cold":
             self.comm.send_hot(key, data)
         else:
             self.comm.send_cold(key, data)
 
-    def _load_tensor(self, key: str, mode: str, delete: bool = True, try_hot_first: bool = False):
-        target_mode = mode if mode in ["hot", "cold"] else "hot"
+    async def _load_tensor(self, key: str, mode: str, delete: bool = True, try_hot_first: bool = False):
+        m = (mode or "").lower()
+
+        if m == "shared":
+            return self.comm.pull_shared(key, delete=delete)
+
+        if self.fast_bypass_comm:
+            async with self.mem_lock:
+                data = self._mem_kv.get(key)
+                if data is None:
+                    return None
+                if delete:
+                    del self._mem_kv[key]
+                return data
+
+        target_mode = m if m in ["hot", "cold"] else "hot"
         if try_hot_first:
             data = self.comm.pull_hot(key, delete=delete)
             if data is not None:
@@ -428,371 +564,353 @@ class LocalExecutor:
             return self.comm.pull_cold(key, delete=delete)
         return self.comm.pull_hot(key, delete=delete)
 
-    async def run(self, func_name: str, path: str, payload: Dict[str, Any], mode: str = "hot") -> Dict[str, Any]:
-        """In-process execution path for LocalExecutor.
-
-        This provides the interface expected by `_invoke_fn`: `await LOCAL_EXECUTOR.run(func_name, http_path, payload)`.
-        It does NOT change simulator semantics; it only fixes the missing method due to an indentation regression.
-        """
-        t_start = time.perf_counter()
-
-        async with self.lock:
-            trace_id = payload.get("trace_id") or f"local_{uuid.uuid4()}"
-
-            res_data: Dict[str, Any] = {"ok": False}
-
-            # ---- Forward ----
-            if path == PATH_FWD:
-                if "pre" in func_name:
-                    x = self._unpack_tensor(payload, "x")
-                    with self._autocast_ctx():
-                        res = self.pre(x)
-
-                    # Save for backward (match original intent)
-                    try:
-                        self._save_tensor(f"{trace_id}_pre", {"x": self._pack_tensor(x)}, mode, force_hot=True)
-                    except Exception:
-                        pass
-
-                    res_data = {
-                        "ok": True,
-                        "trace_id": trace_id,
-                        "expert_inputs": {eid: self._pack_tensor(t) for eid, t in res["expert_inputs"].items()},
-                        "context": {
-                            "residual": self._pack_tensor(res["context"]["residual"]),
-                            "topk_idx": self._pack_tensor(res["context"]["topk_idx"]),
-                            "topk_weights": self._pack_tensor(res["context"]["topk_weights"]),
-                        },
-                        "h": self._pack_tensor(res["hidden_states"]),
-                        "topk_idx": self._pack_tensor(res["expert_indices"]),
-                        "topk_vals": self._pack_tensor(res["expert_weights"]),
-                    }
-
-                elif "expert" in func_name:
-                    eid = int(func_name.split(":")[-1])
-                    inp = self._unpack_tensor(payload, "inp")
-                    with self._autocast_ctx():
-                        out = self.experts[eid](inp)
-
-                    # Save for backward
-                    try:
-                        self._save_tensor(f"{trace_id}_exp_{eid}", {"inp": self._pack_tensor(inp)}, mode, force_hot=True)
-                    except Exception:
-                        pass
-
-                    res_data = {"ok": True, "trace_id": trace_id, "out": self._pack_tensor(out)}
-
-                elif "post" in func_name:
-                    results = payload.get("expert_results", [])
-                    expert_outs = [self._unpack_tensor(r, "out") for r in results]
-                    ctx_raw = payload.get("pre_context", {})
-                    context = {
-                        "residual": self._unpack_tensor(ctx_raw, "residual"),
-                        "topk_idx": self._unpack_tensor(ctx_raw, "topk_idx"),
-                        "topk_weights": self._unpack_tensor(ctx_raw, "topk_weights"),
-                    }
-                    y = self._unpack_tensor(payload, "targets")
-
-                    with self._autocast_ctx():
-                        logits, loss = self.post(expert_outs, context, targets=y)
-
-                    # Cache for backward
-                    if not hasattr(self, "_loss_cache"):
-                        self._loss_cache = {}
-                    self._loss_cache[trace_id] = {"loss": loss, "logits": logits}
-
-                    # Compute acc5 (keep original behavior)
-                    with torch.no_grad():
-                        b_logits = logits.view(-1, logits.size(-1))
-                        b_y = y.view(-1)
-                        _, pred = b_logits.topk(5, dim=-1)
-                        correct = pred.eq(b_y.unsqueeze(-1).expand_as(pred))
-                        acc5_val = correct.any(dim=-1).float().mean().item()
-
-                    res_data = {
-                        "ok": True,
-                        "trace_id": trace_id,
-                        "logits": self._pack_tensor(logits.detach()),
-                        "acc5": acc5_val,
-                        "loss": loss.item() if loss is not None else 0.0,
-                    }
-
-            # ---- Backward ----
-            elif path == PATH_BWD:
-                if "post" in func_name:
-                    cache = getattr(self, "_loss_cache", {}).get(trace_id)
-                    if cache:
-                        self.opt_post.zero_grad(set_to_none=True)
-                        cache["loss"].backward()
-                        # NOTE: original code attempted to return combined grad; keep minimal ok response
-                        res_data = {"ok": True}
-                        try:
-                            del self._loss_cache[trace_id]
-                        except Exception:
-                            pass
-                    else:
-                        res_data = {"ok": False, "error": "loss cache missing"}
-
-                elif "expert" in func_name:
-                    eid = int(func_name.split(":")[-1])
-                    save_key = f"{trace_id}_exp_{eid}"
-                    saved_data = self._load_tensor(save_key, mode, delete=True, try_hot_first=True)
-                    if saved_data:
-                        inp = _to_tensor(saved_data["inp"], device=self.device).requires_grad_(True)
-                        with self._autocast_ctx():
-                            out = self.experts[eid](inp)
-                        grad_out = self._unpack_tensor(payload, "grad_out")
-                        self.opt_exps[eid].zero_grad(set_to_none=True)
-                        out.backward(grad_out)
-                        res_data = {"ok": True, "grad_inp": self._pack_tensor(inp.grad)}
-                    else:
-                        res_data = {"ok": False, "error": "expert trace not found"}
-
-                elif "pre" in func_name:
-                    save_key = f"{trace_id}_pre"
-                    saved_data = self._load_tensor(save_key, mode, delete=True)
-                    if saved_data:
-                        x = _to_tensor(saved_data["x"], device=self.device)
-                        if x.dtype != torch.long:
-                            x = x.long()
-                        with self._autocast_ctx():
-                            res = self.pre(x)
-                        h = res["hidden_states"]
-                        grad_h = self._unpack_tensor(payload, "grad_h")
-                        self.opt_pre.zero_grad(set_to_none=True)
-                        h.backward(grad_h)
-                        res_data = {"ok": True}
-                    else:
-                        res_data = {"ok": False, "error": "pre trace not found"}
-
-            # ---- Optimizer step / zero ----
-            elif path in [PATH_STEP, PATH_ZERO]:
-                try:
-                    if "pre" in func_name:
-                        if path == PATH_STEP:
-                            self.opt_pre.step()
-                        else:
-                            self.opt_pre.zero_grad(set_to_none=True)
-                    if "post" in func_name:
-                        if path == PATH_STEP:
-                            self.opt_post.step()
-                        else:
-                            self.opt_post.zero_grad(set_to_none=True)
-                    if "expert" in func_name:
-                        eid = int(func_name.split(":")[-1])
-                        if path == PATH_STEP:
-                            self.opt_exps[eid].step()
-                        else:
-                            self.opt_exps[eid].zero_grad(set_to_none=True)
-                    res_data = {"ok": True}
-                except Exception as e:
-                    res_data = {"ok": False, "error": str(e)}
-
-            # ---- attach latency/cost metadata ----
-            actual_ms = (time.perf_counter() - t_start) * 1000.0
-            price_rate = 0.00000021
-            res_data.update({
-                "actual_lat": actual_ms,
-                "comp_lat": actual_ms,
-                "net_lat": 0.0,
-                "queue_lat": 0.0,
-                "cost_usd": actual_ms * price_rate,
-                "is_cold": False,
-                "cold_penalty": 0.0,
-                "func_name": func_name,
-            })
-            return res_data
-
-
-
-def _pack_tensor(self, t: torch.Tensor):
-    """Pack tensor for transport/logging. In local in-process GPU mode, avoid CPU serialization by default."""
-    if t is None:
-        return None
-    if SERIALIZE_TENSORS:
-        # existing protocol expects CPU-friendly packed dict
-        tt = t.detach()
-        if tt.is_cuda:
-            tt = tt.to("cpu")
-        return tensor_to_pack(tt)
-    # direct tensor pass (in-process only)
-    return t.detach()
-
-def _autocast_ctx(self):
-    if (self.device.type == "cuda") and AMP_ENABLED:
-        dtype = torch.float16 if AMP_DTYPE == "fp16" else torch.bfloat16
-        return torch.autocast(device_type="cuda", dtype=dtype)
-    return contextlib.nullcontext()
-
-
-    def _save_tensor(self, key: str, data: Dict[str, Any], mode: str, force_hot: bool = False):
-        if force_hot or mode not in ["cold"]:
-            self.comm.send_hot(key, data)
-        else:
-            self.comm.send_cold(key, data)
-
-    def _load_tensor(self, key: str, mode: str, delete: bool = True, try_hot_first: bool = False):
-        target_mode = mode if mode in ["hot", "cold"] else "hot"
-        if try_hot_first:
-            data = self.comm.pull_hot(key, delete=delete)
-            if data is not None: return data
-        if target_mode == "cold":
-            return self.comm.pull_cold(key, delete=delete)
-        else:
-            return self.comm.pull_hot(key, delete=delete)
+    def _maybe_pack(self, t: torch.Tensor) -> Any:
+        """Return tensor directly in direct_tensor_io mode, else pack it."""
+        if self.direct_tensor_io:
+            return t
+        return tensor_to_pack(t)
 
     async def run(self, func_name: str, path: str, payload: Dict[str, Any], mode: str = "http") -> Dict[str, Any]:
-        # 💡 [NEW] 1. 在函数入口记录精确开始时间
         t_start = time.perf_counter()
 
-        async with self.lock:
-            trace_id = payload.get("trace_id")
-            if not trace_id:
-                trace_id = f"local_{uuid.uuid4()}"
+        trace_id = payload.get("trace_id") if isinstance(payload, dict) else None
+        if not trace_id:
+            trace_id = f"local_{uuid.uuid4()}"
 
-            # 用于存储最终业务结果的变量
-            res_data = {"ok": False}
+        res_data: Dict[str, Any] = {"ok": False}
 
-            # --- Forward Pass ---
-            if path == PATH_FWD:
-                if "pre" in func_name:
-                    x = self._unpack_tensor(payload, "x")
-                    with self._autocast_ctx():
-                        res = self.pre(x)
-                    res_data = {
-                        "ok": True,
-                        "trace_id": trace_id,
-                        "expert_inputs": {eid: self._pack_tensor(t) for eid, t in res["expert_inputs"].items()},
-                        "context": {
-                            "residual": self._pack_tensor(res["context"]["residual"]),
-                            "topk_idx": self._pack_tensor(res["context"]["topk_idx"]),
-                            "topk_weights": self._pack_tensor(res["context"]["topk_weights"])
-                        },
-                        "h": self._pack_tensor(res["hidden_states"]),
-                        "topk_idx": self._pack_tensor(res["expert_indices"]),
-                        "topk_vals": self._pack_tensor(res["expert_weights"])
-                    }
+        # --------------------------
+        # Forward
+        # --------------------------
+        if path == PATH_FWD:
+            # 💡 1. 动态检测当前环境是否有 GPU
+            use_cuda = torch.cuda.is_available()
+            my_device_type = 'cuda' if use_cuda else 'cpu'
+            if "pre" in func_name:
+                x = self._unpack_tensor(payload, "x")
 
-                elif "expert" in func_name:
-                    eid = int(func_name.split(":")[-1])
-                    inp = self._unpack_tensor(payload, "inp")
-                    with self._autocast_ctx():
-                        out = self.experts[eid](inp)
-                    res_data = {"ok": True, "trace_id": trace_id, "out": self._pack_tensor(out)}
+                # autocast forward
+                with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    res = self.pre(x)
 
-                elif "post" in func_name:
-                    results = payload.get("expert_results", [])
-                    expert_outs = [self._unpack_tensor(r, "out") for r in results]
-                    ctx_raw = payload.get("pre_context", {})
-                    context = {
-                        "residual": self._unpack_tensor(ctx_raw, "residual"),
-                        "topk_idx": self._unpack_tensor(ctx_raw, "topk_idx"),
-                        "topk_weights": self._unpack_tensor(ctx_raw, "topk_weights")
-                    }
-                    y = self._unpack_tensor(payload, "targets")
-                    with self._autocast_ctx():
-                        logits, loss = self.post(expert_outs, context, targets=y)
+                # save for pre_bwd
+                save_key = f"{trace_id}_pre"
+                # store x directly in direct mode, else store packed
+                await self._save_tensor(save_key,
+                                        {"x": x.detach() if self.direct_tensor_io else tensor_to_pack(x.detach())},
+                                        mode)
 
-                    # 💡 [关键修复] 必须缓存 loss 对象，否则反向传播拿不到梯度
-                    if not hasattr(self, "_loss_cache"): self._loss_cache = {}
-                    self._loss_cache[trace_id] = {"loss": loss, "logits": logits}
+                # build output (direct tensors or packs)
+                expert_inputs = {}
+                for eid, t in res["expert_inputs"].items():
+                    expert_inputs[eid] = t if self.direct_tensor_io else tensor_to_pack(t)
 
-                    with torch.no_grad():
-                        # 1. 统一调整形状：将 logits 变为 [Total_Tokens, Vocab_Size]
-                        # 256 是 4 * 64 的结果
-                        b_logits = logits.view(-1, logits.size(-1))
-                        b_y = y.view(-1)  # 将真实标签变为 [Total_Tokens]
+                ctx = res["context"]
+                res_data = {
+                    "ok": True,
+                    "trace_id": trace_id,
+                    "expert_inputs": expert_inputs,
+                    "context": {
+                        "residual": ctx["residual"] if self.direct_tensor_io else tensor_to_pack(ctx["residual"]),
+                        "topk_idx": ctx["topk_idx"] if self.direct_tensor_io else tensor_to_pack(ctx["topk_idx"]),
+                        "topk_weights": ctx["topk_weights"] if self.direct_tensor_io else tensor_to_pack(
+                            ctx["topk_weights"]),
+                    },
+                    "h": res["hidden_states"] if self.direct_tensor_io else tensor_to_pack(res["hidden_states"]),
+                    "topk_idx": res["expert_indices"] if self.direct_tensor_io else tensor_to_pack(
+                        res["expert_indices"]),
+                    "topk_vals": res["expert_weights"] if self.direct_tensor_io else tensor_to_pack(
+                        res["expert_weights"]),
+                }
 
-                        # 2. 【修正点】使用展平后的 b_logits 获取 topk
-                        # 此时 pred 的形状是 [256, 5]
-                        _, pred = b_logits.topk(5, dim=-1)
+            elif "expert" in func_name:
+                eid = int(func_name.split(":")[-1])
+                inp = self._unpack_tensor(payload, "inp")
 
-                        # 3. 【修正点】使用展平后的 b_y 进行对比
-                        # b_y.unsqueeze(-1) 是 [256, 1]，可以成功 expand 为 [256, 5]
-                        correct = pred.eq(b_y.unsqueeze(-1).expand_as(pred))
-                        acc5_val = correct.any(dim=-1).float().mean().item()
+                with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    out = self.experts[eid](inp)
 
-                    res_data = {
-                        "ok": True,
-                        "trace_id": trace_id,
-                        "logits": self._pack_tensor(logits.detach()),
-                        "acc5": acc5_val,
-                        "loss": loss.item() if loss is not None else 0.0
-                    }
+                save_key = f"{trace_id}_exp_{eid}"
+                await self._save_tensor(
+                    save_key,
+                    {"inp": inp.detach() if self.direct_tensor_io else tensor_to_pack(inp.detach())},
+                    mode
+                )
 
-            # --- Backward Pass ---
-            elif path == PATH_BWD:
-                if "post" in func_name:
-                    cache = getattr(self, "_post_loss_cache", {})
-                    if cache:
-                        self.opt_post.zero_grad()
-                        cache["loss"].backward()
-                        # 获取梯度逻辑...
-                        res_data = {"ok": True, "grad_combined": self._pack_tensor(
-                            cache["logits"].grad or torch.zeros_like(cache["logits"]))}
-                        del self._loss_cache[trace_id]  # 释放内存
+                res_data = {"ok": True, "trace_id": trace_id,
+                            "out": out if self.direct_tensor_io else tensor_to_pack(out)}
+
+            elif "post" in func_name:
+                # NOTE: In split training, we must create "leaf" tensors for expert_outs and residual
+                # so that post_bwd can extract grads for each expert output and residual branch.
+                results = payload.get("expert_results", [])
+                expert_outs: List[torch.Tensor] = []
+                for r in results:
+                    if isinstance(r, dict) and "out" in r:
+                        t = self._maybe_tensor(r["out"])
                     else:
-                        res_data = {"ok": False}
+                        t = self._unpack_tensor(r, "out")
+                    # make leaf for gradient extraction in post_bwd
+                    t = t.detach().requires_grad_(True)
+                    expert_outs.append(t)
 
-                elif "expert" in func_name:
+                ctx_raw = payload.get("pre_context", {}) or {}
+                residual = self._unpack_tensor(ctx_raw, "residual")
+                topk_idx = self._unpack_tensor(ctx_raw, "topk_idx")
+                topk_weights = self._unpack_tensor(ctx_raw, "topk_weights")
+
+                # residual also needs to be leaf for grad extraction
+                residual_leaf = residual.detach().requires_grad_(True) if residual is not None else None
+
+                context = {
+                    "residual": residual_leaf,
+                    "topk_idx": topk_idx,
+                    "topk_weights": topk_weights,
+                }
+                y = self._unpack_tensor(payload, "targets")
+
+                with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    logits, loss = self.post(expert_outs, context, targets=y)
+
+                # ---- NaN/Inf guard: NEVER let NaN enter backward/step ----
+                if (loss is None) or (not torch.isfinite(loss).all()):
+                    # 不缓存 loss，不允许 post_bwd 执行
+                    res_data = {
+                        "ok": True,
+                        "trace_id": trace_id,
+                        "logits": logits.detach() if self.direct_tensor_io else tensor_to_pack(logits.detach()),
+                        "acc5": float("nan") if self.acc_fill_nan else 0.0,
+                        "loss": float("nan"),
+                        "nan_loss": True,
+                    }
+                    # 直接 return（避免下面写 cache）
+                    actual_ms = (time.perf_counter() - t_start) * 1000.0
+                    res_data.update({
+                        "actual_lat": actual_ms, "comp_lat": actual_ms, "net_lat": 0.0, "queue_lat": 0.0,
+                        "cost_usd": actual_ms * self.price_rate, "is_cold": False, "cold_penalty": 0.0,
+                        "func_name": func_name
+                    })
+                    return res_data
+
+                async with self.cache_lock:
+                    self._loss_cache[trace_id] = {
+                        "loss": loss,
+                        "expert_outs_leaf": expert_outs,
+                        "residual_leaf": residual_leaf,
+                    }
+
+                # acc5（低频计算；没算则 NaN/0 取决于 ACC_FILL_NAN）
+                acc5_val = float("nan") if getattr(self, "acc_fill_nan", False) else 0.0
+                self._acc_counter += 1
+                do_acc = (self.compute_acc_every > 0) and (self._acc_counter % self.compute_acc_every == 0) and (
+                            y is not None)
+                if do_acc:
                     try:
-                        eid = int(func_name.split(":")[-1])
-                        save_key = f"{trace_id}_exp_{eid}"
-                        saved_data = self._load_tensor(save_key, mode, delete=True, try_hot_first=True)
-                        if saved_data:
-                            inp = _to_tensor(saved_data["inp"], device=self.device).requires_grad_(True)
-                            out = self.experts[eid](inp)
-                            grad_out = self._unpack_tensor(payload, "grad_out")
-                            self.opt_exps[eid].zero_grad()
-                            out.backward(grad_out)
-                            res_data = {"ok": True, "grad_inp": self._pack_tensor(inp.grad)}
-                        else:
-                            res_data = {"ok": False, "error": "Trace not found"}
+                        # 💡 无论 logits 和 y 是保持原样还是被提前展平了，
+                        # 这里统一把它们强制展平对齐，计算整个 Batch 所有 token 的准确率
+                        lt = logits.view(-1, logits.size(-1))  # 强制变为 (N, VocabSize)
+                        yt = y.view(-1)  # 强制变为 (N,)
+
+                        top5 = torch.topk(lt, k=5, dim=-1).indices  # (N, 5)
+                        acc5_val = float((top5 == yt.unsqueeze(-1)).any(dim=-1).float().mean().item())
                     except Exception as e:
-                        res_data = {"ok": False, "error": str(e)}
+                        # 💡 加上打印报错信息，防止以后再有错误“死得不明不白”
+                        print(f"[ACC Error] {e}", flush=True)
+                        acc5_val = float("nan") if getattr(self, "acc_fill_nan", False) else 0.0
 
-                elif "pre" in func_name:
-                    save_key = f"{trace_id}_pre"
-                    saved_data = self._load_tensor(save_key, mode, delete=True)
-                    if saved_data:
-                        x = _to_tensor(saved_data["x"], device=self.device)
-                        if x.dtype != torch.long: x = x.long()
-                        res = self.pre(x)
-                        h = res["hidden_states"];
-                        grad_h = self._unpack_tensor(payload, "grad_h")
-                        self.opt_pre.zero_grad()
-                        h.backward(grad_h)
-                        res_data = {"ok": True}
-                    else:
-                        res_data = {"ok": False, "error": "Pre trace not found"}
-
-            elif path in [PATH_STEP, PATH_ZERO]:
-                # 处理优化器 Step 或 Zero Grad
-                if "pre" in func_name: getattr(self.opt_pre, "step" if path == PATH_STEP else "zero_grad")()
-                if "post" in func_name: getattr(self.opt_post, "step" if path == PATH_STEP else "zero_grad")()
-                if "expert" in func_name:
-                    try:
-                        eid = int(func_name.split(":")[-1])
-                        getattr(self.opt_exps[eid], "step" if path == PATH_STEP else "zero_grad")()
-                    except:
-                        pass
-                res_data = {"ok": True}
-
-            # 💡 [NEW] 2. 计算实际耗时并注入计费信息
-            actual_ms = (time.perf_counter() - t_start) * 1000.0
-
-            # 计费单价 (USD/ms)，建议与你的 HeatMoE 实验设定保持一致
-            price_rate = 0.00000021
-
-            # 💡 [NEW] 3. 统一封装返回值
-            if isinstance(res_data, dict):
+                # 返回给 controller（run_microbatch 会从这里读 loss/acc5）
+                res_data = {
+                    "ok": True,
+                    "trace_id": trace_id,
+                    "logits": logits.detach() if self.direct_tensor_io else tensor_to_pack(logits.detach()),
+                    "loss": float(loss.detach().item()),
+                    "acc5": acc5_val,
+                    "nan_loss": False,
+                }
+                actual_ms = (time.perf_counter() - t_start) * 1000.0
                 res_data.update({
-                    "actual_lat": actual_ms,
-                    "comp_lat": actual_ms, "net_lat": 0.0, "queue_lat": 0.0,
-                    "cost_usd": actual_ms * 0.00000021,
-                    "is_cold": False, "cold_penalty": 0.0, "func_name": func_name
+                    "actual_lat": actual_ms, "comp_lat": actual_ms, "net_lat": 0.0, "queue_lat": 0.0,
+                    "cost_usd": actual_ms * self.price_rate, "is_cold": False, "cold_penalty": 0.0,
+                    "func_name": func_name
                 })
-            return res_data
+                return res_data
+
+        # --------------------------
+        # Backward
+        # --------------------------
+        elif path == PATH_BWD:
+            if "post" in func_name:
+                # post backward: backprop loss and extract grads for each expert_out and residual leaf tensor
+                async with self.cache_lock:
+                    cache = self._loss_cache.get(trace_id)
+
+                if cache is None:
+                    res_data = {"ok": False, "error": "loss_cache missing"}
+                else:
+                    # guard again
+                    if (cache.get("loss", None) is None) or (not torch.isfinite(cache["loss"]).all()):
+                        res_data = {"ok": False, "error": "nan_loss_cached"}
+                    else:
+                        async with self.opt_post_lock:
+                            self.opt_post.zero_grad(set_to_none=True)
+                            cache["loss"].backward()
+
+                    grads_out_by_eid: Dict[str, Any] = {}
+                    eids = cache.get("expert_eids", [])
+                    for i, t in enumerate(cache.get("expert_outs_leaf", [])):
+                        g = t.grad
+                        if g is None:
+                            continue
+                        key = str(eids[i]) if i < len(eids) else str(i)
+                        grads_out_by_eid[key] = g if self.direct_tensor_io else tensor_to_pack(g)
+
+                    grad_residual = None
+                    rleaf = cache.get("residual_leaf", None)
+                    if rleaf is not None and rleaf.grad is not None:
+                        grad_residual = rleaf.grad if self.direct_tensor_io else tensor_to_pack(rleaf.grad)
+
+                    res_data = {"ok": True, "grads_out_by_eid": grads_out_by_eid, "grad_residual": grad_residual}
+
+                    async with self.cache_lock:
+                        self._loss_cache.pop(trace_id, None)
+
+            elif "expert" in func_name:
+                try:
+                    eid = int(func_name.split(":")[-1])
+                    save_key = f"{trace_id}_exp_{eid}"
+                    saved_data = await self._load_tensor(save_key, mode, delete=True, try_hot_first=True)
+
+                    if not saved_data:
+                        res_data = {"ok": False, "error": "expert trace not found"}
+                    else:
+                        inp_saved = saved_data["inp"]
+                        inp = self._maybe_tensor(inp_saved).detach().requires_grad_(True)
+
+                        with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                            out = self.experts[eid](inp)
+
+                        grad_out = self._unpack_tensor(payload, "grad_out")
+                        if grad_out is None:
+                            grad_out = torch.zeros_like(out)
+
+                        accumulate = bool(payload.get("accumulate", False))
+
+                        async with self.opt_exp_locks[eid]:
+                            if not accumulate:
+                                self.opt_exps[eid].zero_grad(set_to_none=True)
+                            out.backward(grad_out)
+
+                        res_data = {
+                            "ok": True,
+                            "eid": eid,
+                            "grad_inp": inp.grad if self.direct_tensor_io else tensor_to_pack(inp.grad),
+                        }
+                except Exception as e:
+                    res_data = {"ok": False, "error": str(e)}
+            elif "pre" in func_name:
+                save_key = f"{trace_id}_pre"
+                saved_data = await self._load_tensor(save_key, mode, delete=True)
+                if not saved_data:
+                    res_data = {"ok": False, "error": "pre trace not found"}
+                else:
+                    x_saved = saved_data["x"]
+                    x = self._maybe_tensor(x_saved)
+                    if x is not None and x.dtype != torch.long:
+                        x = x.long()
+
+                    grad_residual_pack = payload.get("grad_residual", None) if isinstance(payload, dict) else None
+                    grad_inp_by_eid = payload.get("grad_inp_by_eid", {}) if isinstance(payload, dict) else {}
+
+                    with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                        res = self.pre(x)
+                        expert_inputs = res.get("expert_inputs", {}) or {}
+                        ctx = res.get("context", {}) or {}
+                        residual = ctx.get("residual", None)
+
+                    outs: List[torch.Tensor] = []
+                    grads: List[torch.Tensor] = []
+
+                    # residual branch grad
+                    if residual is not None and grad_residual_pack is not None:
+                        outs.append(residual)
+                        grads.append(self._maybe_tensor(grad_residual_pack))
+
+                    # each expert input grad
+                    for eid, inp in expert_inputs.items():
+                        g_pack = grad_inp_by_eid.get(str(eid))
+                        if g_pack is None:
+                            continue
+                        outs.append(inp)
+                        grads.append(self._maybe_tensor(g_pack))
+
+                    async with self.opt_pre_lock:
+                        self.opt_pre.zero_grad(set_to_none=True)
+                        if outs:
+                            torch.autograd.backward(outs, grads)
+                    res_data = {"ok": True}
+        # --------------------------
+        # Step / Zero
+        # --------------------------
+        elif path in [PATH_STEP, PATH_ZERO]:
+            # Optimizer step / zero (no GradScaler here; bf16 recommended for stability)
+            is_step = (path == PATH_STEP)
+
+            clip = float(os.getenv("GRAD_CLIP_NORM", "1.0"))
+            do_clip = (clip > 0.0) and is_step
+
+            if "pre" in func_name:
+                async with self.opt_pre_lock:
+                    if is_step:
+                        if do_clip:
+                            torch.nn.utils.clip_grad_norm_(self.pre.parameters(), clip)
+                        self.opt_pre.step()
+                    else:
+                        self.opt_pre.zero_grad(set_to_none=True)
+
+            if "post" in func_name:
+                async with self.opt_post_lock:
+                    if is_step:
+                        if do_clip:
+                            torch.nn.utils.clip_grad_norm_(self.post.parameters(), clip)
+                        self.opt_post.step()
+                    else:
+                        self.opt_post.zero_grad(set_to_none=True)
+
+            if "expert" in func_name:
+                try:
+                    eid = int(func_name.split(":")[-1])
+                    async with self.opt_exp_locks[eid]:
+                        if is_step:
+                            if do_clip:
+                                torch.nn.utils.clip_grad_norm_(self.experts[eid].parameters(), clip)
+                            self.opt_exps[eid].step()
+                            self.opt_exps[eid].zero_grad(set_to_none=True)
+                        else:
+                            self.opt_exps[eid].zero_grad(set_to_none=True)
+                except Exception:
+                    pass
+
+            res_data = {"ok": True}
+
+        # --------------------------
+        # Attach timing/cost fields
+        # --------------------------
+        actual_ms = (time.perf_counter() - t_start) * 1000.0
+        if isinstance(res_data, dict):
+            res_data.update(
+                {
+                    "actual_lat": actual_ms,
+                    "comp_lat": actual_ms,
+                    "net_lat": 0.0,
+                    "queue_lat": 0.0,
+                    "cost_usd": actual_ms * self.price_rate,
+                    "is_cold": False,
+                    "cold_penalty": 0.0,
+                    "func_name": func_name,
+                }
+            )
+        return res_data
+
 
 # ============================================================
 # Load instances / func map
@@ -893,41 +1011,104 @@ AUTOSCALER = SimulatedAutoscaler()
 # ============================================================
 
 class HotColdHeatmap:
-    def __init__(self, num_experts: int, decay: float = 0.98, min_prob: float = 0.01):
-        self.num_experts = num_experts
-        self.decay = decay
-        self.min_prob = min_prob
-        self.scores = np.ones(num_experts, dtype=np.float32) / num_experts
+    """
+    EWMA 热度（专家访问强度）：
+      heat[e] = decay * heat[e] + (1-decay) * add[e]
+    然后用 top-K (HOTSET_SIZE) 作为 hot set。
+    可选：进入/退出阈值 + 最短驻留，避免抖动（开关可控）。
+    """
+
+    def __init__(self, num_experts: int):
+        self.num_experts = int(num_experts)
+        self.decay = float(os.getenv("HEAT_EWMA_DECAY", os.getenv("HEATMAP_DECAY", "0.98")))
+        self.min_prob = float(os.getenv("HEAT_MIN_PROB", os.getenv("HEATMAP_MIN_PROB", "0.01")))
+
+        # optional anti-flap
+        self.use_hysteresis = os.getenv("HEAT_HYSTERESIS", "1") == "1"
+        self.hot_enter_p = float(os.getenv("HOT_ENTER_P", "0.20"))
+        self.hot_exit_p = float(os.getenv("HOT_EXIT_P", "0.12"))
+        self.min_stay_steps = int(os.getenv("HOT_MIN_STAY_STEPS", "30"))
+
+        self.update_every = int(os.getenv("HEATMAP_UPDATE_EVERY", "1"))
+
+        self.heat = np.ones(self.num_experts, dtype=np.float32) / self.num_experts
+        self._step = 0
+        self._is_hot = np.zeros(self.num_experts, dtype=np.int32)
+        self._stay = np.zeros(self.num_experts, dtype=np.int32)
 
     def update_from_routing(self, topk_idx: torch.Tensor, topk_vals: torch.Tensor):
+        self._step += 1
+        if self.update_every > 1 and (self._step % self.update_every != 0):
+            return
+
         idx = topk_idx.reshape(-1).detach().cpu().numpy()
         vals = topk_vals.reshape(-1).detach().cpu().numpy()
+
         add = np.zeros(self.num_experts, dtype=np.float32)
         for e, v in zip(idx, vals):
-            add[int(e)] += float(v)
-        self.scores *= self.decay
-        self.scores += (1.0 - self.decay) * add
-        self.scores = np.maximum(self.scores, self.min_prob)
-        self.scores /= (self.scores.sum() + 1e-9)
+            ei = int(e)
+            if 0 <= ei < self.num_experts:
+                add[ei] += float(v)
+
+        self.heat *= self.decay
+        self.heat += (1.0 - self.decay) * add
+
+        # avoid zeros
+        self.heat = np.maximum(self.heat, self.min_prob)
+
+        # normalize
+        s = float(self.heat.sum() + 1e-9)
+        self.heat /= s
+
+        if not self.use_hysteresis:
+            # hot label will be derived by top-k in hot_set()
+            return
+
+        mx = float(np.max(self.heat) + 1e-9)
+        enter_th = self.hot_enter_p * mx
+        exit_th = self.hot_exit_p * mx
+
+        for i in range(self.num_experts):
+            if self._is_hot[i]:
+                self._stay[i] += 1
+                if self._stay[i] >= self.min_stay_steps and self.heat[i] <= exit_th:
+                    self._is_hot[i] = 0
+                    self._stay[i] = 0
+            else:
+                if self.heat[i] >= enter_th:
+                    self._is_hot[i] = 1
+                    self._stay[i] = 0
 
     def hot_set(self, k: int) -> List[int]:
-        k = max(1, min(k, self.num_experts))
-        return list(np.argsort(-self.scores)[:k])
+        k = max(1, min(int(k), self.num_experts))
 
+        # prefer stable-hot if hysteresis enabled
+        if self.use_hysteresis:
+            stable = [i for i in range(self.num_experts) if self._is_hot[i] == 1]
+            stable = sorted(stable, key=lambda i: float(self.heat[i]), reverse=True)
+            if len(stable) >= k:
+                return stable[:k]
 
-HEATMAP = HotColdHeatmap(NUM_EXPERTS, HEATMAP_DECAY, HEATMAP_MIN_PROB)
+        # fill by top heat
+        order = list(range(self.num_experts))
+        order.sort(key=lambda i: float(self.heat[i]), reverse=True)
+        return order[:k]
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {"heat": self.heat.copy(), "is_hot": self._is_hot.copy()}
+
+HEATMAP = HotColdHeatmap(NUM_EXPERTS)
 HEATMAP_LOCK = asyncio.Lock()
 PREV_HOT_SET = None
-
 
 def _mode_net_multiplier(mode: str) -> float:
     m = (mode or "").lower()
     if m == "hot": return HOT_NET_MUL
     if m == "cold": return COLD_NET_MUL
+    if m == "shared": return SHARED_NET_MUL
     if m == "http": return HTTP_NET_MUL
     if m == "fallback": return FALLBACK_NET_MUL
     return HTTP_NET_MUL
-
 
 class InstanceManager:
     def __init__(self):
@@ -1125,6 +1306,7 @@ class LocalTransientError(RuntimeError):
     """Transient local failure (busy/oom). Should be retried, not crash the training loop."""
     pass
 
+
 async def simulate_invoke_with_breakdown(
         inst: Dict[str, Any],
         base_compute_ms: float,
@@ -1240,8 +1422,6 @@ except:
     aiohttp = None
 import requests
 
-
-
 _HTTP_SEM = asyncio.Semaphore(max(1, HTTP_CONCURRENCY))
 
 
@@ -1270,19 +1450,415 @@ class BaselineScheduler:
 
 BASELINE_SCHED = BaselineScheduler()
 
+# ============================================================
+# Online NN + Heuristic Hybrid Scheduler + NSGA-II selection (for expert backward)
+# ============================================================
+
+# ---- Online NN hyperparams ----
+NN_LR = float(os.getenv("NN_LR", "3e-4"))
+NN_BATCH = int(os.getenv("NN_BATCH", "64"))
+NN_WARMUP = int(os.getenv("NN_WARMUP", "200"))
+NN_TRAIN_EVERY = int(os.getenv("NN_TRAIN_EVERY", "10"))
+NN_BUFFER = int(os.getenv("NN_BUFFER", "5000"))
+
+USE_NSGA_FOR_EXPERT_BWD = os.getenv("USE_NSGA_FOR_EXPERT_BWD", "1") == "1"
+NSGA_K = int(os.getenv("NSGA_K", "8"))
+
+
+# ---- Feature engineering ----
+def _fn_kind_from_name(fn: str) -> str:
+    fn = (fn or "").lower()
+    if "pre" in fn and "bwd" not in fn and "apply" not in fn:
+        return "pre"
+    if "post" in fn and "bwd" not in fn and "apply" not in fn:
+        return "post"
+    if "expert" in fn and "bwd" not in fn:
+        return "expert"
+    if "pre" in fn and "bwd" in fn:
+        return "pre_bwd"
+    if "post" in fn and "bwd" in fn:
+        return "post_bwd"
+    if "expert" in fn and "bwd" in fn:
+        return "expert_bwd"
+    return "other"
+
+
+class OnlineLatencyNet(nn.Module):
+    """Small MLP for online latency prediction (total_ms)."""
+
+    def __init__(self, in_dim: int = 18, hid: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid),
+            nn.ReLU(),
+            nn.Linear(hid, hid),
+            nn.ReLU(),
+            nn.Linear(hid, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+class OnlinePredictor:
+    """
+    Online predictor for invocation latency.
+    - add_sample(feat, y_ms)
+    - train_step() every NN_TRAIN_EVERY steps
+    """
+
+    def __init__(self):
+        self.device = torch.device("cuda" if (torch.cuda.is_available() and str(DEVICE).startswith("cuda")) else "cpu")
+        self.model = OnlineLatencyNet(in_dim=18, hid=64).to(self.device)
+        self.opt = torch.optim.AdamW(self.model.parameters(), lr=NN_LR)
+
+        self.buf_x: List[np.ndarray] = []
+        self.buf_y: List[float] = []
+        self.steps = 0
+
+        # normalization scales (rough)
+        self.comp_scale = float(os.getenv("NN_COMP_SCALE", "400.0"))
+        self.net_scale = float(os.getenv("NN_NET_SCALE", "120.0"))
+        self.price_scale = float(os.getenv("NN_PRICE_SCALE", "0.00001"))
+
+    def featurize(self, inst: Dict[str, Any], *, func_name: str, mode: str, base_compute_ms: float,
+                  req: Dict[str, Any]) -> np.ndarray:
+        meta = inst.get("meta", {}) or {}
+        perf = float(meta.get("performance", DEFAULT_PERFORMANCE))
+        rtt = float(meta.get("rtt_ms", meta.get("net_latency_ms", DEFAULT_NET_LATENCY)))
+        price = float(meta.get("price", meta.get("price_usd_ms", 0.00000021)))
+
+        # mode one-hot: hot/cold/http/fallback
+        m = (mode or "").lower()
+        mode_hot = 1.0 if m == "hot" else 0.0
+        mode_cold = 1.0 if m == "cold" else 0.0
+        mode_http = 1.0 if m == "http" else 0.0
+        mode_fb = 1.0 if m == "fallback" else 0.0
+
+        # func kind one-hot
+        k = _fn_kind_from_name(func_name)
+        kind_pre = 1.0 if k == "pre" else 0.0
+        kind_post = 1.0 if k == "post" else 0.0
+        kind_exp = 1.0 if k == "expert" else 0.0
+        kind_pre_bwd = 1.0 if k == "pre_bwd" else 0.0
+        kind_post_bwd = 1.0 if k == "post_bwd" else 0.0
+        kind_exp_bwd = 1.0 if k == "expert_bwd" else 0.0
+
+        # request size proxy: tokens if present else 0
+        tok = 0.0
+        if isinstance(req, dict):
+            for kk in ["tokens", "num_tokens", "n_tokens", "seq_len"]:
+                if kk in req:
+                    try:
+                        tok = float(req[kk])
+                        break
+                    except Exception:
+                        pass
+        tok = tok / float(max(1, SEQ_LEN * MICRO_BATCH))
+
+        # normalized compute/net/price
+        comp = float(base_compute_ms) / max(self.comp_scale, 1e-6)
+        net = float(rtt) / max(self.net_scale, 1e-6)
+        pr = float(price) / max(self.price_scale, 1e-9)
+        inv_perf = 1.0 / max(perf, 1e-6)
+
+        # cold start estimate
+        cold_est = float(meta.get("cold_start_ms", INSTANCE_MGR._default_cold_start_ms(func_name, inst))) / 2000.0
+
+        # region flags
+        region = str(inst.get("region", "local")).lower()
+        is_local = 1.0 if "local" in region else 0.0
+        is_remote = 1.0 if not ("local" in region) else 0.0
+
+        feat = np.array([
+            mode_hot, mode_cold, mode_http, mode_fb,
+            kind_pre, kind_post, kind_exp, kind_pre_bwd, kind_post_bwd, kind_exp_bwd,
+            tok,
+            comp, net, pr, inv_perf, cold_est,
+            is_local, is_remote
+        ], dtype=np.float32)
+        return feat
+
+    def predict(self, feat: np.ndarray) -> Optional[float]:
+        if len(self.buf_y) < NN_WARMUP:
+            return None
+        x = torch.from_numpy(feat).to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            yhat = float(self.model(x).item())
+        return float(max(1.0, yhat))
+
+    def add_sample(self, feat: np.ndarray, y_ms: float):
+        if y_ms is None:
+            return
+        try:
+            y = float(y_ms)
+        except Exception:
+            return
+        if not np.isfinite(y):
+            return
+        self.buf_x.append(feat)
+        self.buf_y.append(y)
+        if len(self.buf_y) > NN_BUFFER:
+            self.buf_x = self.buf_x[-NN_BUFFER:]
+            self.buf_y = self.buf_y[-NN_BUFFER:]
+        self.steps += 1
+
+    def train_step(self):
+        if len(self.buf_y) < max(32, NN_WARMUP):
+            return
+        bs = min(NN_BATCH, len(self.buf_y))
+        idx = np.random.randint(0, len(self.buf_y), size=(bs,))
+        xb = torch.from_numpy(np.stack([self.buf_x[i] for i in idx], axis=0)).to(self.device)
+        yb = torch.from_numpy(np.array([self.buf_y[i] for i in idx], dtype=np.float32)).to(self.device)
+
+        self.model.train()
+        pred = self.model(xb)
+        loss = F.smooth_l1_loss(pred, yb)
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.opt.step()
+        self.model.eval()
+
+
+ONLINE_PRED = OnlinePredictor()
+
+
+# ---- NSGA-II core (fast non-dominated sorting + crowding distance) ----
+def _dominates_obj(a: np.ndarray, b: np.ndarray) -> bool:
+    return np.all(a <= b) and np.any(a < b)
+
+
+def _fast_non_dominated_sort(objs: np.ndarray) -> List[List[int]]:
+    n = objs.shape[0]
+    S = [[] for _ in range(n)]
+    n_dom = np.zeros(n, dtype=np.int32)
+    fronts: List[List[int]] = [[]]
+    for p in range(n):
+        for q in range(n):
+            if p == q:
+                continue
+            if _dominates_obj(objs[p], objs[q]):
+                S[p].append(q)
+            elif _dominates_obj(objs[q], objs[p]):
+                n_dom[p] += 1
+        if n_dom[p] == 0:
+            fronts[0].append(p)
+    i = 0
+    while i < len(fronts) and fronts[i]:
+        nxt = []
+        for p in fronts[i]:
+            for q in S[p]:
+                n_dom[q] -= 1
+                if n_dom[q] == 0:
+                    nxt.append(q)
+        i += 1
+        if nxt:
+            fronts.append(nxt)
+        else:
+            break
+    return fronts
+
+
+def _crowding_distance(front: List[int], objs: np.ndarray) -> Dict[int, float]:
+    dist = {i: 0.0 for i in front}
+    if len(front) <= 2:
+        for i in front:
+            dist[i] = float("inf")
+        return dist
+    m = objs.shape[1]
+    for k in range(m):
+        vals = [(i, float(objs[i, k])) for i in front]
+        vals.sort(key=lambda x: x[1])
+        dist[vals[0][0]] = float("inf")
+        dist[vals[-1][0]] = float("inf")
+        vmin = vals[0][1]
+        vmax = vals[-1][1]
+        if vmax - vmin < 1e-12:
+            continue
+        for t in range(1, len(vals) - 1):
+            dist[vals[t][0]] += (vals[t + 1][1] - vals[t - 1][1]) / (vmax - vmin)
+    return dist
+
+
+def _nsga2_select(objs: np.ndarray, k: int) -> List[int]:
+    fronts = _fast_non_dominated_sort(objs)
+    chosen: List[int] = []
+    for fr in fronts:
+        if len(chosen) + len(fr) <= k:
+            chosen.extend(fr)
+        else:
+            cd = _crowding_distance(fr, objs)
+            fr_sorted = sorted(fr, key=lambda i: cd[i], reverse=True)
+            chosen.extend(fr_sorted[: max(0, k - len(chosen))])
+            break
+    return chosen
+
 
 class HybridScheduler:
+    """
+    论文版混合调度：
+      - Online NN predictor：预测 latency（在线训练）
+      - Heuristic rules：cost/cold/queue/deadline 惩罚
+      - Expert backward：可选 NSGA-II（lat,cost,cold）做候选过滤，再用 heuristic tie-break
+    """
+
     def __init__(self):
         self.ema_lat: Dict[str, float] = {}
         self.ema_decay = float(os.getenv("SCHED_EMA_DECAY", "0.95"))
 
-    def update_stats(self, inst, tot_ms):
+    def update_stats(self, *args, **kwargs):
+        """
+        兼容两种签名：
+          1) update_stats(inst, tot_ms)
+          2) update_stats(func_name, logical_id, inst, req, tot_ms)
+        只做 instance 级 EWMA latency。
+        """
+        inst = None
+        tot_ms = None
+
+        if len(args) == 2 and isinstance(args[0], dict):
+            inst, tot_ms = args[0], args[1]
+        elif len(args) >= 5 and isinstance(args[2], dict):
+            inst, tot_ms = args[2], args[4]
+        else:
+            inst = kwargs.get("inst", None)
+            tot_ms = kwargs.get("tot_ms", None)
+
+        if inst is None or tot_ms is None:
+            return
+
         inst_id = inst.get("id")
+        if not inst_id:
+            return
+
+        try:
+            tot_ms = float(tot_ms)
+        except Exception:
+            return
+
         v = self.ema_lat.get(inst_id)
         if v is None:
-            self.ema_lat[inst_id] = float(tot_ms)
+            self.ema_lat[inst_id] = tot_ms
         else:
-            self.ema_lat[inst_id] = self.ema_decay * v + (1.0 - self.ema_decay) * float(tot_ms)
+            self.ema_lat[inst_id] = self.ema_decay * v + (1.0 - self.ema_decay) * tot_ms
+
+    def _heuristic_components(self, inst: Dict[str, Any], *, func_name: str, mode: str, base_compute_ms: float) ->     Tuple[float, float, float, float]:
+        """
+        Return (lat_ms, cost_usd, cold_ms, queue_ms).
+
+        - FULL: uses static predictor that includes cold start + network multipliers.
+        - no_heuristic: intentionally *blind* to cold/net/queue so scheduling degrades
+          (this makes the ablation meaningful in plots).
+        """
+        meta = inst.get("meta", {}) or {}
+        perf = float(meta.get("performance", DEFAULT_PERFORMANCE))
+
+        if ABL_CFG.disable_heuristic:
+            # naive model: compute-only, ignores cold + network + queue
+            compute_ms = float(base_compute_ms) / max(perf, 1e-6)
+            lat = float(compute_ms)
+            cost = _cost_usd(inst, lat)
+            return float(lat), float(cost), 0.0, 0.0
+
+        # full heuristic: (lat,cost,cold,queue) from static predictor
+        lat, cost, queue_ms, cold_ms, _net = _predict_static_total_ms_and_cost(
+            inst, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms
+        )
+        return float(lat), float(cost), float(cold_ms), float(queue_ms)
+
+    def _score(self, lat_ms: float, cost_usd: float, cold_ms: float, queue_ms: float, *, deadline_ms: float) -> float:
+        late_pen = max(0.0, lat_ms - float(deadline_ms)) / max(1.0, float(deadline_ms))
+        return (
+                SCHED_W_LAT * float(lat_ms)
+                + SCHED_W_COST * float(cost_usd) * 1000.0
+                + SCHED_W_COLD * float(cold_ms)
+                + SCHED_W_QUEUE * float(queue_ms)
+                + 2000.0 * float(late_pen)
+        )
+
+    def select(self, func_name: str, inst_list: List[Dict[str, Any]], *, req: Dict[str, Any], global_step: int,
+               mode: str, base_compute_ms: float, deadline_ms: float) -> Tuple[Dict[str, Any], float, str]:
+        kind = _fn_kind_from_name(func_name)
+        use_nsga = (kind == "expert_bwd") and USE_NSGA_FOR_EXPERT_BWD and (not ABL_CFG.disable_nsga)
+        if not inst_list:
+            raise RuntimeError("empty inst_list")
+
+        kind = _fn_kind_from_name(func_name)
+        force_nsga = (kind == "expert_bwd")
+
+        feats = []
+        objs = []
+        preds_lat = []
+        preds_cost = []
+        preds_cold = []
+        preds_queue = []
+
+        for inst in inst_list:
+            h_lat, h_cost, h_cold, h_queue = self._heuristic_components(inst, func_name=func_name, mode=mode,
+                                                                        base_compute_ms=base_compute_ms)
+            feat = ONLINE_PRED.featurize(inst, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms, req=req)
+
+            # -----------------------------
+            # Online NN predictor (guarded)
+            # -----------------------------
+            nn_lat = None if ABL_CFG.disable_online_pred else ONLINE_PRED.predict(feat)
+
+            # Trust online only when it is stable; otherwise fallback to heuristic.
+            # This is critical to make FULL consistently outperform no_online.
+            if nn_lat is not None:
+                try:
+                    r2 = float(PRED_MONITOR.get_r2())
+                    mae = float(PRED_MONITOR.get_mae())
+                except Exception:
+                    r2, mae = 0.0, 1e18
+
+                r2_th = float(os.getenv("NN_TRUST_R2_TH", "0.20"))
+                mae_th = float(os.getenv("NN_TRUST_MAE_TH", "200.0"))  # ms
+                warm = int(os.getenv("NN_TRUST_WARMUP", "60"))
+
+                if (global_step < warm) or (r2 < r2_th) or (mae > mae_th):
+                    nn_lat = None
+                else:
+                    # clip to avoid catastrophic mispredictions dominating selection
+                    lo = float(os.getenv("NN_CLIP_LO", "0.6"))
+                    hi = float(os.getenv("NN_CLIP_HI", "1.6"))
+                    nn_lat = float(np.clip(float(nn_lat), lo * float(h_lat), hi * float(h_lat)))
+
+            lat = float(nn_lat) if (nn_lat is not None) else float(h_lat)
+
+            feats.append((inst, feat))
+            preds_lat.append(lat)
+            preds_cost.append(float(h_cost))  # keep your cost model stable
+            preds_cold.append(float(h_cold))
+            preds_queue.append(float(h_queue))
+
+            # 3-objective: (lat, cost, cold) minimization
+            objs.append([lat, float(h_cost), float(h_cold)])
+
+        objs = np.asarray(objs, dtype=np.float32)
+
+        # deadline filter first
+        idx_ok = [i for i in range(len(inst_list)) if preds_lat[i] <= float(deadline_ms)]
+        cand_idx = idx_ok if idx_ok else list(range(len(inst_list)))
+
+        selector = "heuristic"
+        if (not ABL_CFG.disable_nsga) and force_nsga and USE_NSGA_FOR_EXPERT_BWD and len(cand_idx) > 1:
+            sub = objs[cand_idx]
+            picked_rel = _nsga2_select(sub, k=min(NSGA_K, len(cand_idx)))
+            cand_idx = [cand_idx[i] for i in picked_rel]
+            selector = "nsga2"
+
+        # tie-break with heuristic score (hybrid)
+        best_i, best_s = None, 1e18
+        for i in cand_idx:
+            s = self._score(preds_lat[i], preds_cost[i], preds_cold[i], preds_queue[i], deadline_ms=deadline_ms)
+            if s < best_s:
+                best_s, best_i = s, i
+
+        inst = inst_list[int(best_i)]
+        pred_lat = float(preds_lat[int(best_i)])
+        return inst, pred_lat, selector
 
 
 HYBRID_SCHED = HybridScheduler()
@@ -1341,6 +1917,14 @@ class TriScheduler:
         return HYBRID_SCHED.ema_lat.get(inst.get("id"))
 
     def _heuristic(self, inst, *, func_name, mode, base_compute_ms):
+        if getattr(ABL_CFG, "use_random_sched", False):
+            import random
+            # Random 模式：彻底瞎分发，给出极大的随机惩罚分
+            return random.random() * 1000.0, 0.0, 0.0, 0.0
+            # 👆👆👆 --- [新增代码结束] --- 👆👆👆
+
+        if getattr(ABL_CFG, "disable_heuristic", False):
+            return 1e9, 0.0, 0.0, 0.0
         if ABL_CFG.disable_heuristic: return 1e9, 0.0, 0.0, 0.0
         tot_ms, cost, queue_ms, cold_ms, _ = _predict_static_total_ms_and_cost(inst, func_name=func_name, mode=mode,
                                                                                base_compute_ms=base_compute_ms)
@@ -1380,18 +1964,50 @@ class TriScheduler:
             feats.append((lat, h_cost, h_cold, h_queue))
         ok = [i for i, (lat, _, _, _) in enumerate(feats) if lat <= float(deadline_ms)]
         cand_idx = ok if ok else list(range(len(inst_list)))
-        if ABL_CFG.disable_nsga or len(cand_idx) <= 1:
+
+        # ===== NSGA gate：只允许 expert_bwd 使用 NSGA-II =====
+        kind = _fn_kind_from_name(func_name)
+        use_nsga = (kind == "expert_bwd") and USE_NSGA_FOR_EXPERT_BWD and (not ABL_CFG.disable_nsga)
+
+        # 前向 / 非 expert_bwd：只用启发式 + NN（不走 NSGA）
+        if (not use_nsga) or len(cand_idx) <= 1:
             best_i, best_s = None, 1e18
             for i in cand_idx:
                 s = self._score(*feats[i])
-                if s < best_s: best_s, best_i = s, i
+                if s < best_s:
+                    best_s, best_i = s, i
             return inst_list[int(best_i)]
-        pts = [(feats[i][0], feats[i][1]) for i in cand_idx]
-        front = [cand_idx[j] for j in self._pareto_front(pts)]
+
+        # ===== expert_bwd：NSGA-II 多目标 (lat, cost, load) =====
+        objs = []
+        idx_map = []
+        for i in cand_idx:
+            inst = inst_list[i]
+            lat, cost, cold_ms, queue_ms = feats[i]
+
+            # load = inflight / max_concurrency（越大越差）
+            try:
+                sem = _get_inst_sem(inst)
+                maxc = _get_inst_max_conc(inst)
+                free = int(getattr(sem, "_value", maxc))
+                inflight = max(0, maxc - free)
+                load = inflight / max(1, maxc)
+            except Exception:
+                load = 0.0
+
+            objs.append([float(lat), float(cost), float(load)])
+            idx_map.append(i)
+
+        objs = np.asarray(objs, dtype=np.float64)
+        pick = _nsga2_select(objs, k=min(NSGA_K, len(idx_map)))
+        chosen = [idx_map[j] for j in pick]
+
+        # 用你的 score 作为最终 tie-break（保证消融/对比口径一致）
         best_i, best_s = None, 1e18
-        for i in front:
+        for i in chosen:
             s = self._score(*feats[i])
-            if s < best_s: best_s, best_i = s, i
+            if s < best_s:
+                best_s, best_i = s, i
         return inst_list[int(best_i)]
 
     # controller.py 约 1100 行 class TriScheduler 内插入
@@ -1479,7 +2095,7 @@ async def invoke_with_retry(
     retry_cnt = 0
     last_err = None
 
-    async def _simulate_one(inst, pred_ms_val: float):
+    async def _simulate_one(inst, pred_ms_val: float, selector_name: str):
         # simulate breakdown; may raise LocalTransientError/RuntimeError
         breakdown_tuple = await simulate_invoke_with_breakdown(
             inst,
@@ -1491,6 +2107,15 @@ async def invoke_with_retry(
         )
         actual_ms, queue_lat, cold_lat, net_lat, comp_lat = breakdown_tuple
         total_ms = float(min(max(actual_ms, 0.001), 15000.0))
+        # ---- online NN: add sample + periodic train ----
+        try:
+            feat = ONLINE_PRED.featurize(inst, func_name=func_name, mode=mode, base_compute_ms=base_compute_ms, req=req)
+            ONLINE_PRED.add_sample(feat, total_ms)
+            ONLINE_PRED.steps += 1
+            if (not ABL_CFG.disable_online_pred) and (ONLINE_PRED.steps % NN_TRAIN_EVERY == 0):
+                ONLINE_PRED.train_step()
+        except Exception:
+            pass
 
         price_rate = float(inst.get("meta", {}).get("price", 0.00000021))
         cost_usd = total_ms * price_rate
@@ -1514,11 +2139,13 @@ async def invoke_with_retry(
         if SIM_SLEEP:
             await asyncio.sleep(total_ms / 1000.0)
 
+        pred_cold_ms = float(INSTANCE_MGR._default_cold_start_ms(func_name, inst))
         meta = {
             "ok": True,
             "func_name": func_name,
             "actual_lat": total_ms,
             "pred_lat": float(pred_ms_val),
+            "selector": str(selector_name),
             "cost_usd": float(cost_usd),
             "is_cold": float(cold_lat) > 0.0,
             "cold_penalty": float(cold_lat),
@@ -1526,6 +2153,7 @@ async def invoke_with_retry(
             "comp_lat": float(comp_lat),
             "queue_lat": float(queue_lat),
             "raw_breakdown": breakdown_tuple,
+            "pred_cold_ms": float(pred_cold_ms),
         }
         return meta
 
@@ -1535,7 +2163,7 @@ async def invoke_with_retry(
     # forced instance path
     if forced_inst is not None:
         try:
-            meta = await _simulate_one(forced_inst, 0.0)
+            meta = await _simulate_one(forced_inst, 0.0, "forced")
             return forced_inst, meta, retry_cnt
         except Exception as e:
             last_err = e
@@ -1544,22 +2172,30 @@ async def invoke_with_retry(
     while tries < max_tries and cand:
         tries += 1
 
-        # ---- select instance (keep your existing selection logic if available) ----
+        # ---- select instance (ONLINE NN + heuristic; NSGA-II for expert backward) ----
         inst = None
         pred_ms = 0.0
+        selector = "heuristic"
         try:
-            # If you have a predictor-based selection, keep it:
             if not ABL_CFG.is_baseline:
-                inst, pred_ms = HYBRID_SCHED.select(func_name, cand, req=req, global_step=global_step)
+                dl = float(DEADLINE_EST.deadline_ms(global_step))
+                inst, pred_ms, selector = HYBRID_SCHED.select(
+                    func_name, cand,
+                    req=req, global_step=global_step,
+                    mode=mode, base_compute_ms=base_compute_ms, deadline_ms=dl
+                )
             else:
                 inst = random.choice(cand)
                 pred_ms = 0.0
+                selector = "baseline"
         except Exception:
             inst = random.choice(cand)
             pred_ms = 0.0
+            selector = "fallback"
 
         try:
-            meta = await _simulate_one(inst, pred_ms)
+            meta = await _simulate_one(inst, pred_ms, selector)
+
             return inst, meta, retry_cnt
 
         except LocalTransientError as e:
@@ -1704,6 +2340,7 @@ async def _invoke_fn(func_name, *, mode, base_compute_ms, http_path, payload, gl
         obj = await invoke_http(inst, path=http_path, payload=payload) if USE_HTTP_EXEC else {}
     return inst, obj, meta, retry_cnt
 
+
 # ============================================================
 # Main Train Loop (UNCHANGED logic, just shortened for brevity)
 # ============================================================
@@ -1829,7 +2466,8 @@ class ExpertUpdatePolicy:
         upd, cold_upd = [], 0
         for eid in range(self.n):
             if eid in hot_set:
-                upd.append(eid); self.pending[eid] = 0
+                upd.append(eid);
+                self.pending[eid] = 0
             else:
                 self.pending[eid] += 1
                 if self.pending[eid] >= self.cold_acc: upd.append(eid); cold_upd += 1; self.pending[eid] = 0
@@ -1839,109 +2477,241 @@ class ExpertUpdatePolicy:
 POLICY = ExpertUpdatePolicy(NUM_EXPERTS, COLD_ACC_STEPS)
 
 
-# =========================================================================
-# 【最终修复版 2.0】run_microbatch
-# 修复了 TypeError: missing 'http_path' and 'global_step'
-# =========================================================================
 async def run_microbatch(step: int, micro_step: int, x: torch.Tensor, y: torch.Tensor):
     split = "train"
     trace_id = f"step_{step}_mb_{micro_step}_{uuid.uuid4().hex[:8]}"
     my_device = DEVICE
+
     x_tok = x.to(my_device)
     y_tok = y.to(my_device)
 
-    all_mb_rows = []  # 💡 统一收集所有调用的 res_meta 字典
+    all_mb_rows = []
 
-    # 1. 训练准备：Zero Grad
+    # 1) zero grad (pre/post/expert 的 zero 由各自执行；这里至少 pre_zero 保留你原逻辑)
     if split == "train":
-        # _invoke_fn 返回 (inst, obj, res_meta, retry_cnt)
-        res_zero = await _invoke_fn("moe.pre_zero", mode="http", payload={}, base_compute_ms=0, http_path=PATH_ZERO,
-                                    global_step=step)
-        # 确保加入的是字典
+        res_zero = await _invoke_fn("moe.pre_zero", mode="shared", payload={}, base_compute_ms=0,
+                                    http_path=PATH_ZERO, global_step=step)
         all_mb_rows.append(res_zero[2] if isinstance(res_zero, tuple) else res_zero)
 
+        # 建议也加 post_zero（否则 post 的梯度可能累积）
+        res_zero2 = await _invoke_fn("moe.post_zero", mode="shared", payload={}, base_compute_ms=0,
+                                     http_path=PATH_ZERO, global_step=step)
+        all_mb_rows.append(res_zero2[2] if isinstance(res_zero2, tuple) else res_zero2)
+
     # ============================================================
-    # 2. Forward 流程
+    # 2) Forward
     # ============================================================
-    # Pre Stage
-    _, pre_obj, bd1, _ = await _invoke_fn("moe.pre_fwd", mode="http", payload={"x": _maybe_pack_tensor(x_tok)},
-                                          base_compute_ms=10.0, http_path=PATH_FWD, global_step=step)
+    # Pre fwd（必须带 trace_id）
+    _, pre_obj, bd1, _ = await _invoke_fn(
+        "moe.pre_fwd", mode="http",
+        payload={"trace_id": trace_id, "x": tensor_to_pack(x_tok)},
+        base_compute_ms=10.0, http_path=PATH_FWD, global_step=step
+    )
     all_mb_rows.append(bd1)
 
-    # Expert Stage
-    expert_inputs = pre_obj.get("expert_inputs", {})
-    fwd_tasks = [
-        _invoke_fn(f"moe.expert_fwd:{eid}", mode="hot", payload={"inp": pack}, base_compute_ms=20.0, http_path=PATH_FWD,
-                   global_step=step) for eid, pack in expert_inputs.items()]
+    # ---- update heatmap & decide hot/cold ----
+    try:
+        async with HEATMAP_LOCK:
+            ctx = pre_obj.get("context", {}) if isinstance(pre_obj.get("context", {}), dict) else {}
+            topk_idx = ctx.get("topk_idx", None)
+            topk_vals = ctx.get("topk_weights", None)
+            if topk_idx is not None and topk_vals is not None:
+                HEATMAP.update_from_routing(_to_tensor(topk_idx, device="cpu"), _to_tensor(topk_vals, device="cpu"))
+            hot_set = set(HEATMAP.hot_set(HOTSET_SIZE))
+    except Exception:
+        hot_set = set(range(NUM_EXPERTS))
+    # 💡 修复：如果是在跑 no_hotcold 消融实验，强行清空热专家池，并关闭异步更新
+        # === 🚀 新增：彻底支持所有 Baseline 和 Ablation 的同步逻辑 ===
+        _b_mode = os.getenv("BASELINE_MODE", "")
+
+        # 1. 消融实验：关闭冷热感知
+        if getattr(ABL_CFG, "disable_hotcold", False):
+            hot_set = set()
+            ABL_CFG.force_sync_update = True
+
+        # 2. BSP (Bulk Synchronous Parallel): 强制同步屏障
+        # 表现：不区分冷热，主线程必须死等所有专家（无论多慢）算完并更新参数才进入下一步。
+        # 预期结果：Loss 极其平稳，但 Step Time 会被冷启动拖垮，延迟极高。
+        elif _b_mode == "bsp":
+            hot_set = set()
+            ABL_CFG.force_sync_update = True
+
+        # 3. ASP (Asynchronous Parallel): 纯异步放飞自我
+        # 表现：不区分冷热，主线程不设等待屏障，专家算完立刻在后台异步更新自己的参数。
+        # 预期结果：Step Time 极快，但因为“陈旧梯度 (Stale Gradients)”满天飞，Loss 极易发散崩盘。
+        elif _b_mode == "asp":
+            hot_set = set()
+            ABL_CFG.force_sync_update = False
+            os.environ["COLD_ACC_STEPS"] = "1"  # 强制冷专家憋气步数为1，算完立刻异步更新，绝不等待
+        # =========================================================
+
+    # decide which experts will APPLY (step) this iteration (hot 每步更新，cold 走累积/延迟)
+    upd_eids, cold_upd, pending_mean = POLICY.decide(list(hot_set))
+
+    expert_inputs = pre_obj.get("expert_inputs", {})  # {eid: pack_tensor}
+    expert_eids = list(expert_inputs.keys())
+
+    # Expert fwd（必须带 trace_id）
+    fwd_tasks = []
+    for eid, inp_pack in expert_inputs.items():
+        fwd_tasks.append(_limited_expert(
+            _invoke_fn(
+                f"moe.expert_fwd:{eid}", mode=("hot" if eid in hot_set else "cold"),
+                payload={"trace_id": trace_id, "inp": inp_pack},
+                base_compute_ms=20.0, http_path=PATH_FWD, global_step=step
+            )
+        ))
     expert_results = await asyncio.gather(*fwd_tasks)
 
-    # 💡 [修复] 此时 res 是元组 (inst, obj, res_meta, retry_cnt)，必须取 res[2]
     for res in expert_results:
         all_mb_rows.append(res[2])
 
-    exp_outs = [res[1] for res in expert_results]
-    t2 = max([res[2].get("actual_lat", 0.0) for res in expert_results]) if expert_results else 0
+    exp_outs = [res[1] for res in expert_results]  # list of obj dict (contain "out")
 
-    # Post Stage
-    _, post_obj, bd3, _ = await _invoke_fn("moe.post_fwd", mode="http",
-                                           payload={"expert_results": exp_outs,
-                                                    "pre_context": pre_obj.get("context", {}),
-                                                    "targets": _maybe_pack_tensor(y_tok)},
-                                           base_compute_ms=10.0, http_path=PATH_FWD, global_step=step)
+    # Post fwd（必须带 trace_id + expert_eids）
+    _, post_obj, bd3, _ = await _invoke_fn(
+        "moe.post_fwd", mode="http",
+        payload={
+            "trace_id": trace_id,
+            "expert_eids": expert_eids,  # 关键：让 post_bwd 能对齐梯度
+            "expert_results": exp_outs,
+            "pre_context": pre_obj.get("context", {}),
+            "targets": tensor_to_pack(y_tok),
+        },
+        base_compute_ms=10.0, http_path=PATH_FWD, global_step=step
+    )
     all_mb_rows.append(bd3)
+    # -------------------------------
+    # NaN/Inf guard (microbatch-level)
+    # 一旦 post_fwd 得到 NaN，就直接跳过 backward + step，避免污染参数
+    # -------------------------------
+    loss_tmp = post_obj.get("loss", None)
 
+    def _is_finite_number(v):
+        try:
+            return (v is not None) and np.isfinite(float(v))
+        except Exception:
+            return False
+
+    if (post_obj.get("nan_loss", False)) or (not _is_finite_number(loss_tmp)):
+        # 保险：把本 microbatch 标记为 nan_loss，并且不要进入 backward/step
+        loss_val = float("nan")
+        acc5_val = float("nan")
+
+        # 这里可选：清一下 pre/post 的梯度缓存（你本 microbatch 开头已经 zero 过，但再做一次更稳）
+        if split == "train":
+            res_zero = await _invoke_fn("moe.pre_zero", mode="shared", payload={}, base_compute_ms=0,
+                                        http_path=PATH_ZERO, global_step=step)
+            all_mb_rows.append(res_zero[2] if isinstance(res_zero, tuple) else res_zero)
+
+            res_zero2 = await _invoke_fn("moe.post_zero", mode="shared", payload={}, base_compute_ms=0,
+                                         http_path=PATH_ZERO, global_step=step)
+            all_mb_rows.append(res_zero2[2] if isinstance(res_zero2, tuple) else res_zero2)
+
+        # 直接 early return：不反传、不 step
+        final_cold = sum([1 for r in all_mb_rows if isinstance(r, dict) and r.get("is_cold")])
+        final_total = len(all_mb_rows)
+        return {
+            "loss": loss_val,
+            "acc5": acc5_val,
+            "nan_loss": True,
+            "cold_upd": 0,
+            "pending_mean": float(POLICY.pending_mean() if hasattr(POLICY, "pending_mean") else 0.0),
+            "rows": all_mb_rows,
+            "hot_ratio": (final_total - final_cold) / final_total if final_total > 0 else 1.0,
+        }
+
+    # 正常路径才会走到这里
     loss_val = post_obj.get("loss", 0.0)
     acc5_val = post_obj.get("acc5", 0.0)
 
     # ============================================================
-    # 3. 训练核心：Backward & Step (HeatMoE 策略)
+    # 3) Backward & Step
     # ============================================================
     if split == "train":
-        # (A) Post Backward
-        _, bwd_post_obj, bbd1, _ = await _invoke_fn("moe.post_bwd", mode="http", payload={"trace_id": trace_id},
-                                                    base_compute_ms=15.0, http_path=PATH_BWD, global_step=step)
+        # (A) Post backward：返回每个 expert_out 的 grad + residual 的 grad
+        _, post_bwd_obj, bbd1, _ = await _invoke_fn(
+            "moe.post_bwd", mode="shared",
+            payload={"trace_id": trace_id},
+            base_compute_ms=15.0, http_path=PATH_BWD, global_step=step
+        )
         all_mb_rows.append(bbd1)
-        grad_combined = bwd_post_obj.get("grad_combined")
 
-        # (B) Expert Backward
-        bwd_tasks = [
-            _invoke_fn(f"moe.expert_bwd:{eid}", mode="hot", payload={"trace_id": trace_id, "grad_out": grad_combined},
-                       base_compute_ms=30.0, http_path=PATH_BWD, global_step=step)
-            for eid in expert_inputs.keys()
-        ]
+        grads_out_by_eid = post_bwd_obj.get("grads_out_by_eid", {})  # {str(eid): pack_grad}
+        grad_residual = post_bwd_obj.get("grad_residual", None)  # pack_grad or None
+
+        # (B) Expert backward：每个 expert 用自己的 grad_out
+        bwd_tasks = []
+        for eid in expert_eids:
+            grad_out = grads_out_by_eid.get(str(eid))
+            if grad_out is None:
+                continue
+            bwd_tasks.append(_limited_expert(
+                _invoke_fn(
+                    f"moe.expert_bwd:{eid}", mode=("hot" if eid in hot_set else "cold"),
+                    payload={"trace_id": trace_id, "grad_out": grad_out, "accumulate": (eid not in upd_eids)},
+                    base_compute_ms=30.0, http_path=PATH_BWD, global_step=step
+                )
+            ))
         expert_bwd_results = await asyncio.gather(*bwd_tasks)
-        for res in expert_bwd_results:
-            all_mb_rows.append(res[2])  # 💡 同样取 res[2]
 
-        # (C) Pre Backward
-        grad_h = expert_bwd_results[0][1].get("grad_inp") if expert_bwd_results else None
-        _, _, bbd3, _ = await _invoke_fn("moe.pre_bwd", mode="http", payload={"trace_id": trace_id, "grad_h": grad_h},
-                                         base_compute_ms=15.0, http_path=PATH_BWD, global_step=step)
+        for res in expert_bwd_results:
+            all_mb_rows.append(res[2])
+
+        # 收集每个 expert_input 的梯度（grad_inp）
+        grad_inp_by_eid = {}
+        for res in expert_bwd_results:
+            obj = res[1]  # expert_bwd obj
+            # obj 应该带 {"eid":..., "grad_inp":...}
+            if isinstance(obj, dict):
+                eid = obj.get("eid", None)
+                g = obj.get("grad_inp", None)
+                if eid is not None and g is not None:
+                    grad_inp_by_eid[str(eid)] = g
+
+        # (C) Pre backward：用 grad_residual + grad_inp_by_eid 回传
+        _, _, bbd3, _ = await _invoke_fn(
+            "moe.pre_bwd", mode="shared",
+            payload={
+                "trace_id": trace_id,
+                "grad_residual": grad_residual,
+                "grad_inp_by_eid": grad_inp_by_eid,
+            },
+            base_compute_ms=15.0, http_path=PATH_BWD, global_step=step
+        )
         all_mb_rows.append(bbd3)
 
-        # (D) Optimizer Step
+        # (D) Step：一定要包含 post_step
         hot_set = HEATMAP.hot_set(HOTSET_SIZE)
         upd_eids, _, _ = POLICY.decide(hot_set)
-        step_tasks = [_invoke_fn("moe.pre_step", mode="http", payload={}, base_compute_ms=5, http_path=PATH_STEP,
-                                 global_step=step)]
+
+        step_tasks = [
+            _invoke_fn("moe.pre_step", mode="shared", payload={}, base_compute_ms=5, http_path=PATH_STEP,
+                       global_step=step),
+            _invoke_fn("moe.post_step", mode="shared", payload={}, base_compute_ms=5, http_path=PATH_STEP,
+                       global_step=step),
+        ]
         for eid in upd_eids:
-            step_tasks.append(
-                _invoke_fn(f"moe.expert_step:{eid}", mode="hot", payload={}, base_compute_ms=10, http_path=PATH_STEP,
-                           global_step=step))
+            step_tasks.append(_limited_expert(
+                _invoke_fn(f"moe.expert_step:{eid}", mode=("hot" if eid in hot_set else "cold"), payload={},
+                           base_compute_ms=10,
+                           http_path=PATH_STEP, global_step=step)
+            ))
         s_results = await asyncio.gather(*step_tasks)
         for res in s_results:
             all_mb_rows.append(res[2])
 
     # ============================================================
-    # 4. 最终数据统计与返回 (鲁棒版)
+    # 4) 汇总
     # ============================================================
-    # 使用列表推导式前，先确保 r 都是字典
     final_cold = sum([1 for r in all_mb_rows if isinstance(r, dict) and r.get("is_cold")])
     final_total = len(all_mb_rows)
 
     return {
         "loss": loss_val,
         "acc5": acc5_val,
+        "cold_upd": cold_upd,
+        "pending_mean": pending_mean,
         "rows": all_mb_rows,
         "hot_ratio": (final_total - final_cold) / final_total if final_total > 0 else 1.0,
     }
@@ -1986,7 +2756,8 @@ async def train():
             continue
 
         # 并发执行微批次任务
-        tasks = [run_microbatch(step, i, xs[i], ys[i]) for i in range(mb)]
+        # 并发执行微批次任务（限流，防止 CPU OOM）
+        tasks = [_limited_mb(run_microbatch(step, i, xs[i], ys[i])) for i in range(mb)]
         results = await asyncio.gather(*tasks)
 
         # 展平所有调用记录
@@ -2022,17 +2793,35 @@ async def train():
                 func_name = r.get("func_name", "")
                 is_valid_time = 1.0 < r["actual_lat"] < 5000.0  # 物理限幅
                 if "fwd" in func_name and is_valid_time:
-                    PRED_MONITOR.update(
-                        pred_lat=r["pred_lat"],
-                        actual_lat=r["actual_lat"]
-                    )
+                    pred_target = (os.getenv("PRED_TARGET", "total") or "total").lower()
+
+                    pred_lat = float(r.get("pred_lat", 0.0))
+                    actual_lat = float(r.get("actual_lat", 0.0))
+
+                    if pred_target == "nocold":
+                        # 去掉真实 cold_penalty；预测侧用 pred_cold_ms 做近似剥离
+                        actual_lat = max(0.0, actual_lat - float(r.get("cold_penalty", 0.0)))
+                        pred_lat = max(0.0, pred_lat - float(r.get("pred_cold_ms", 0.0)))
+
+                    PRED_MONITOR.update(pred_lat=pred_lat, actual_lat=actual_lat)
 
         # 获取最新的 R2 和 MAE
         current_r2, current_mae = PRED_MONITOR.get_r2_mae()
 
         # 3. 基础指标聚合
         loss = float(np.mean([r.get("loss", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0
-        acc5 = float(np.mean([r.get("acc5", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0
+        if valid_mb_results:
+            acc_list = [r.get("acc5", float("nan")) for r in valid_mb_results]
+            if os.getenv("ACC_FILL_NAN", "0") == "1":
+                # 全 NaN 时 np.nanmean 会 warning；这里做保护
+                acc_arr = np.array(acc_list, dtype=np.float32)
+                valid = acc_arr[np.isfinite(acc_arr)]
+                acc5 = float(valid.mean()) if valid.size > 0 else float("nan")
+            else:
+                acc5 = float(
+                    np.mean([0.0 if (a is None or (isinstance(a, float) and np.isnan(a))) else a for a in acc_list]))
+        else:
+            acc5 = float("nan") if os.getenv("ACC_FILL_NAN", "0") == "1" else 0.0
         hot_ratio = float(np.mean([r.get("hot_ratio", 0.0) for r in valid_mb_results])) if valid_mb_results else 0.0
 
         # 4. 详细延迟指标 (带空值保护，修复 RuntimeWarning)
@@ -2063,6 +2852,22 @@ async def train():
 
         # 6. SLO 计算
         step_time_ms = (time.perf_counter() - t_step0) * 1000.0
+
+        # === [TAIL] update rolling + global tail/stability stats for step_time_ms ===
+        split_key = split
+        _STEP_TIME_ROLL.setdefault(split_key, deque(maxlen=TAIL_STAT_WINDOW))
+        _STEP_TIME_ROLL[split_key].append(float(step_time_ms))
+        roll_p95, roll_p99, roll_cv = _tail_stats_from_list(list(_STEP_TIME_ROLL[split_key]))
+
+        # global: reservoir for percentiles + Welford for exact CV
+        st = _STEP_TIME_WELFORD.setdefault(split_key, {"n": 0.0, "mean": 0.0, "m2": 0.0})
+        _welford_update(st, float(step_time_ms))
+        glob_cv = _welford_cv(st)
+        seen = int(st["n"])
+        _STEP_TIME_RES.setdefault(split_key, [])
+        _reservoir_add(_STEP_TIME_RES[split_key], float(step_time_ms), cap=GLOBAL_STAT_RESERVOIR, seen=seen)
+        glob_p95, glob_p99, _ = _tail_stats_from_list(_STEP_TIME_RES[split_key])
+
         DEADLINE_EST.update(step_time_ms)
         current_deadline = float(DEADLINE_EST.deadline_ms(step))
         # 违约判定：平均微批次时间是否超过 Deadline
@@ -2076,6 +2881,12 @@ async def train():
             loss=loss,
             acc_top5=acc5,
             step_time_ms=step_time_ms,
+            step_time_p95_ms=roll_p95,
+            step_time_p99_ms=roll_p99,
+            step_time_cv=roll_cv,
+            step_time_global_p95_ms=glob_p95,
+            step_time_global_p99_ms=glob_p99,
+            step_time_global_cv=glob_cv,
             predictor_r2=float(current_r2),
             predictor_mae=float(current_mae),
             inv_cold_cnt=inv_cold_cnt,
@@ -2098,9 +2909,10 @@ async def train():
         if (step % LOG_TRAIN_EVERY) == 0 or split == "val":
             print(
                 f"[{split}] step={step} loss={loss:.4f} acc5={acc5:.4f} "
-                f"time={step_time_ms:.0f}ms cost=${total_cost:.6f} R2={current_r2:.3f} "
-                f"comp={inv_comp_ms:.1f}ms net={inv_net_ms:.1f}ms"
+                f"time={step_time_ms:.0f}ms p95={roll_p95:.0f}ms cv={roll_cv:.3f} cost=${total_cost:.6f} R2={current_r2:.3f} "
+                f"comp={inv_comp_ms:.1f}ms net={inv_net_ms:.1f}ms", flush=True
             )
+
 
 def main():
     # ==========================================
@@ -2109,10 +2921,6 @@ def main():
     global LOCAL_EXECUTOR  # 1. 声明使用全局变量
     global logger
     logger = MetricsLogger(os.getenv("METRICS_FILE", "metrics.csv"))
-
-    # 实例化预测监控器（用于计算 R2）
-    # 如果你的代码里有 class PredictionMonitor 但没这一行，请加上：
-    PRED_MONITOR = PredictionMonitor()
 
     # 2. 如果开启了本地计算模式 (默认开启)，则初始化它
     if os.getenv("USE_HTTP_EXEC", "0") == "0":

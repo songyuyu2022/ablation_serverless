@@ -11,7 +11,8 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, List
-
+import time
+from collections import deque
 from shared import dumps, loads  # 复用你已有的 msgpack 序列化工具
 from utils.logger import log
 
@@ -109,6 +110,64 @@ class LocalKVStore:
             res.append(rel)
         return res
 
+class InMemoryKVStore:
+    """
+    进程内内存 KV，模拟 Memcached/Redis（共享梯度高速通道）。
+    - set: O(1)
+    - get(delete=True): 原子 pop（竞争消费）
+    - list_keys(prefix): O(n)（但 shared key 数通常可控）
+    可选 TTL：SHARED_TTL_S>0 时自动过期清理。
+    """
+    def __init__(self, ttl_s: float = 0.0):
+        self._lock = threading.Lock()
+        self._kv: Dict[str, bytes] = {}
+        self._ts: Dict[str, float] = {}
+        self._keys = deque()  # insertion order
+        self.ttl_s = float(ttl_s)
+
+    def _gc(self):
+        if self.ttl_s <= 0:
+            return
+        now = time.time()
+        # 简单增量清理：每次操作清一点（避免全量扫描）
+        for _ in range(min(256, len(self._keys))):
+            if not self._keys:
+                break
+            k = self._keys[0]
+            ts = self._ts.get(k, None)
+            if ts is None:
+                self._keys.popleft()
+                continue
+            if now - ts > self.ttl_s:
+                self._keys.popleft()
+                self._kv.pop(k, None)
+                self._ts.pop(k, None)
+            else:
+                break  # 队首未过期就停止
+
+    def set(self, key: str, value: bytes) -> None:
+        with self._lock:
+            self._gc()
+            self._kv[key] = value
+            self._ts[key] = time.time()
+            self._keys.append(key)
+
+    def get(self, key: str, delete: bool = False) -> Optional[bytes]:
+        with self._lock:
+            self._gc()
+            if key not in self._kv:
+                return None
+            if delete:
+                self._ts.pop(key, None)
+                return self._kv.pop(key, None)
+            return self._kv.get(key)
+
+    def list_keys(self, prefix: str = "") -> List[str]:
+        with self._lock:
+            self._gc()
+            if not prefix:
+                return list(self._kv.keys())
+            return [k for k in self._kv.keys() if k.startswith(prefix)]
 
 class CommManager:
     """
@@ -121,16 +180,39 @@ class CommManager:
     - ./comm_sim/cold
     """
 
+    def send_shared(self, expert_id: str, obj: Dict[str, Any]) -> str:
+        """共享梯度通道（例如 pre/post backward 的共享梯度、residual 分支梯度）"""
+        key = self._generate_unique_key(expert_id)
+        bs = dumps(obj)
+        self._shared.set(key, bs)
+        log("comm", f"send_shared: expert_id={expert_id}, key={key}, bytes={len(bs)}")
+        return key
+
+    def pull_shared(self, expert_id: str, delete: bool = True) -> Optional[Dict[str, Any]]:
+        obj = self._pull_any(self._shared, expert_id, delete=delete)
+        if obj is not None:
+            log("comm", f"pull_shared: expert_id={expert_id}, ok=True")
+        return obj
+
     def __init__(self, base_dir: Optional[str] = None):
         base_dir = base_dir or os.getenv("COMM_SIM_DIR", "comm_sim")
         base = Path(base_dir)
         hot_dir = base / "hot"
         cold_dir = base / "cold"
-
         self._hot = LocalKVStore(str(hot_dir))
         self._cold = LocalKVStore(str(cold_dir))
 
-        log("comm", f"CommManager initialized, base_dir={base_dir}")
+        shared_backend = os.getenv("SHARED_BACKEND", "mem").lower().strip()
+        shared_ttl_s = float(os.getenv("SHARED_TTL_S", "0"))  # 0 = no ttl
+
+        if shared_backend == "file":
+            shared_dir = base / "shared"
+            self._shared = LocalKVStore(str(shared_dir))
+        else:
+            # 默认 mem：模拟独占内存高速通道（Memcached/Redis）
+            self._shared = InMemoryKVStore(ttl_s=shared_ttl_s)
+
+        log("comm", f"CommManager initialized, base_dir={base_dir}, shared_backend={shared_backend}")
 
     # -------- 通用辅助方法 --------
 
@@ -174,7 +256,7 @@ class CommManager:
         key = self._generate_unique_key(expert_id)
         data = dumps(obj)
         self._hot.set(key, data)
-        log("comm", f"send_hot: expert_id={expert_id}, key={key}, bytes={len(data)}")
+        # log("comm", f"send_hot: expert_id={expert_id}, key={key}, bytes={len(data)}")
 
     def pull_hot(self, expert_id: str, delete: bool = True) -> Optional[Dict[str, Any]]:
         return self._pull_any(self._hot, expert_id, delete)
@@ -185,7 +267,7 @@ class CommManager:
         key = self._generate_unique_key(expert_id)
         data = dumps(obj)
         self._cold.set(key, data)
-        log("comm", f"send_cold: expert_id={expert_id}, key={key}, bytes={len(data)}")
+        # log("comm", f"send_cold: expert_id={expert_id}, key={key}, bytes={len(data)}")
 
     def pull_cold(self, expert_id: str, delete: bool = True) -> Optional[Dict[str, Any]]:
         return self._pull_any(self._cold, expert_id, delete)

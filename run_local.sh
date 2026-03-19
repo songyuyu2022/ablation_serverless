@@ -28,8 +28,8 @@ export INSTANCES_FILE="instances.json"
 export FUNC_MAP_FILE="func_map.json"
 
 # 单卡 3090：只用一张卡（可按需指定 0）
-# export CUDA_VISIBLE_DEVICES="0"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="0"
+#export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 export USE_HTTP_EXEC="0"
 export LOCAL_COMPUTE="1"
@@ -48,30 +48,70 @@ export RETRY_BACKOFF_MAX_MS="50"
 # Network latency sanity protection
 export MIN_NET_LATENCY_RATIO="0.05"
 
-export KEEP_ALIVE_MS="5000"
-export EVICTION_BASE_PROB="0.02"
-export EVICTION_TAU_MS="20000"
+export KEEP_ALIVE_MS="1000"
+export EVICTION_BASE_PROB="0.09"
+export EVICTION_TAU_MS="3000"
 
 # 拉大压力
-export EXP_MAX_CONCURRENCY="1"
-export HOT_PROB="0.75"
+export FAST_LOCAL_BYPASS_COMM="1"
+export SEQ_LEN=512
+export MICRO_BATCH=8
+export BATCH_SIZE=16
+export MAX_INFLIGHT_MICROBATCH="2"
+export MAX_INFLIGHT_EXPERT="4"
+export EXP_MAX_CONCURRENCY="4"
+export HOT_PROB="0.40"
+export NUM_EXPERTS="16"          # 极其关键！如果不加，默认只有 4 个专家，冷启动出不来
+export WARM_PROB="0.25"          # 配合 HOT_PROB 打散流量
+export HOTSPOT_DRIFT_EVERY="20"  # 让热点频繁漂移，制造真实的系统动荡
 export COLD_EXPERT_LOAD_MS="400"
+export EMB_DIM=768          # 512 -> 768（模型更重
+export TOP_K=2              # 保持2，别太大
+export AMP_DTYPE=bf16
+export GRAD_CLIP_NORM=1.0
 
 # GPU/AMP（3090 推荐）
 export DEVICE="${DEVICE:-cuda}"
 export AMP_ENABLED="${AMP_ENABLED:-1}"
-export AMP_DTYPE="${AMP_DTYPE:-fp16}"
-
-# 防 OOM/更稳定：先保守，跑通后再调大
-export MAX_INFLIGHT_MICROBATCH="${MAX_INFLIGHT_MICROBATCH:-1}"
-export MAX_INFLIGHT_EXPERT="${MAX_INFLIGHT_EXPERT:-1}"
 
 # 你若使用“本地 in-process”，强烈建议关闭张量序列化（避免 CPU 内存爆）
 export SERIALIZE_TENSORS="${SERIALIZE_TENSORS:-0}"
 
-if [[ -z "${MAX_STEPS:-}" ]]; then
-  export MAX_STEPS="2000"
-fi
+# -----------------------------
+# Hot/Cold hysteresis tuning (让冷热差异更明显)
+# -----------------------------
+export HOTSET_SIZE="2"            # 先从 1 开始最容易拉开差异
+export HOT_ENTER_P="0.55"
+export HOT_EXIT_P="0.45"
+export HOT_MIN_STAY_STEPS="8"
+export HEATMAP_UPDATE_EVERY="1"
+export HEATMAP_DECAY="0.90"
+export HEATMAP_TREND_DECAY="0.85"
+
+# -----------------------------
+# Acc logging (画图友好：未计算写 NaN)
+# -----------------------------
+export ACC_EVERY="1"              # 每 5 step 计算一次 acc5（可调 1/5/10）
+export ACC_FILL_NAN="0"
+
+# -----------------------------
+# Predictor monitoring target (让 R2 更稳定)
+# -----------------------------
+export PRED_TARGET="nocold"       # 监控时用 (actual - cold) 对齐预测更稳
+export PRED_MONITOR_WINDOW="200"  # 增大 R2 统计窗口（默认 50 太短）
+export MAX_STEPS="500"
+export MAX_GPU_COMPUTE_MS="800.0"  # 把上限放宽到 800ms
+export COLD_ACC_STEPS="5"    # 让冷专家积攒 10 步（约 5 秒）才去更新
+
+export LR_PRE="3e-4"
+export LR_POST="3e-4"
+export LR_EXP="3e-4"
+
+export NN_TRUST_WARMUP="60"
+export NN_TRUST_R2_TH="0.20"
+export NN_TRUST_MAE_TH="200.0"
+export NN_CLIP_LO="0.6"
+export NN_CLIP_HI="1.6"
 
 # ------------------------------------------------
 # Result root directory (NEW)
@@ -97,6 +137,8 @@ echo " [1] Run Ours (Full)"
 echo " [2] Run Ablations"
 echo " [3] Run Baselines"
 echo " [4] Run ALL (Paper Set)"
+echo " [5] Run ONLY missing modes (BSP/SSP/ASP + no_heuristic)"
+echo " [6] Run Custom (自由输入想跑的单个或多个模式)"  # <--- 新增这行
 echo "================================================"
 echo " [S] Single seed"
 echo " [M] Multi-seed (0,1,2)"
@@ -191,6 +233,30 @@ run_choice() {
       done
       for m in no_hotcold no_nsga no_online; do
         run_controller "ablation" "$m" "$seed"
+      done
+      ;;
+    "5")
+      # Only run missing ones:
+      # baselines: bsp / asp
+      for m in bsp asp; do
+        run_controller "baseline" "$m" "$seed"
+      done
+      # ablation: no_heuristic
+      run_controller "ablation" "no_heuristic" "$seed"
+      ;;
+    "6")
+      # ==========================================================
+      # 👇 在这里直接修改你想跑的模式（用空格隔开）👇
+      # 可选：round_robin random bsp ssp asp greedy no_nsga no_online no_hotcold no_heuristic
+      # ==========================================================
+      local custom_modes="no_nsga no_online full no_heuristic"
+
+      for m in $custom_modes; do
+        if [[ "$m" == "round_robin" || "$m" == "random" || "$m" == "asp" || "$m" == "bsp" || "$m" == "ssp" || "$m" == "greedy" ]]; then
+          run_controller "baseline" "$m" "$seed"
+        else
+          run_controller "ablation" "$m" "$seed"
+        fi
       done
       ;;
     *)
